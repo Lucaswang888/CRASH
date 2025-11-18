@@ -1,0 +1,353 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import os
+import numpy as np
+import pickle
+import torch
+from torch.utils.data import Dataset
+
+
+
+class DADDataset(Dataset):
+    """
+    DAD 数据集：
+    - data_path / <feature>_features / training/*.npz
+    - 每个 .npz 里通常包含：
+        'data'  : 特征，形状大致 [T, N_obj+1, feat_dim] 或 [T, feat_dim,...]
+        'labels': 帧级别标签，形状 [2, T]，第 0 行是 negative，第 1 行是 positive
+        'det'   : 检测框信息
+        'ID'    : 视频 ID
+    这里我们只需要：
+        - 视频级别标签：是否有事故 → one-hot [2]，如 [1,0] / [0,1]
+        - toa：如果有事故，就给一个固定时间（例如 90），否则 n_frames+1
+    """
+
+    def __init__(self, data_path, feature, phase='training',
+                 toTensor=False, device=torch.device('cuda'), vis=False):
+        self.data_path = os.path.join(data_path, feature + '_features')
+        self.feature = feature
+        self.phase = phase          # 'training' / 'testing'
+        self.toTensor = toTensor
+        self.device = device
+        self.vis = vis
+
+        self.n_frames = 100
+        self.n_obj = 19
+        self.fps = 20.0
+
+        # 如果你后面用得到 dim_feature，可以用这个；不用也没关系
+        self.dim_feature = self.get_feature_dim(feature)
+
+        # 当前 phase 对应的 .npz 列表
+        filepath = os.path.join(self.data_path, phase)
+        self.files_list = self.get_filelist(filepath)
+
+    # ---------- 基本工具函数 ----------
+
+    def get_feature_dim(self, feature_name):
+        """
+        根据特征类型返回维度，如果你有别的特征可以在这里扩展。
+        """
+        if feature_name == 'vgg16':
+            return 4096
+        elif feature_name == 'res101':
+            return 2048
+        else:
+            # 如果你不依赖 dim_feature，可以直接返回一个占位值
+            # 或者改成 pass
+            return 512
+
+    def get_filelist(self, filepath):
+        """
+        列出某个文件夹下的所有文件名（排序后），用于构建数据列表。
+        """
+        assert os.path.exists(filepath), "Directory does not exist: %s" % (filepath)
+        file_list = []
+        for filename in sorted(os.listdir(filepath)):
+            file_list.append(filename)
+        return file_list
+
+    def __len__(self):
+        return len(self.files_list)
+
+    # ---------- 核心：取一个样本 ----------
+
+    def __getitem__(self, index):
+        data_file = os.path.join(self.data_path, self.phase, self.files_list[index])
+        assert os.path.exists(data_file), f"File not found: {data_file}"
+
+        try:
+            data = np.load(data_file, allow_pickle=True)
+            features = data['data']
+            labels = data['labels']   # [2, T]：每一帧的 2 类标签
+            detections = data['det']
+        except Exception as e:
+            raise IOError(f'Load data error! File: {data_file}, error: {e}')
+
+        # ===== 1. 从帧级标签得到“视频级别标签” =====
+        # labels[1, :] 是否有任意一帧为 1
+        has_crash = bool(labels[1].any())
+        if has_crash:
+            label_onehot = np.array([0, 1], dtype=np.float32)   # 正样本
+            toa_value = 90.0                                   # 论文里常用固定观测点
+        else:
+            label_onehot = np.array([1, 0], dtype=np.float32)   # 负样本
+            toa_value = self.n_frames + 1                      # 事故发生在观察窗口之后
+
+        toa = np.array([toa_value], dtype=np.float32)           # [1]
+
+        # ===== 2. 转成 Tensor =====
+        if self.toTensor:
+            features = torch.tensor(features, dtype=torch.float32, device=self.device)
+            label_onehot = torch.tensor(label_onehot, dtype=torch.float32, device=self.device)
+            toa = torch.tensor(toa, dtype=torch.float32, device=self.device)
+
+        # ===== 3. vis 模式下多返回 detection & video_id，其他情况只返回 (x, y, toa) =====
+        if self.vis:
+            # 注意：这里的 ID 字段名字，跟你数据里的保持一致；
+            # 常见写法是 data['ID'] 或 data['id']，你可以自己调整一下。
+            video_id = str(data['ID']) if 'ID' in data else str(index)
+            return features, label_onehot, toa, detections, video_id
+        else:
+            return features, label_onehot, toa
+
+
+
+
+class CrashDataset(Dataset):
+    def __init__(self, data_path, feature, phase='train', toTensor=False, device=torch.device('cuda'), vis=False):
+        self.data_path = data_path
+        self.feature = feature
+        self.phase = phase
+        self.toTensor = toTensor
+        self.device = device
+        self.vis = vis
+        self.n_frames = 50
+        self.n_obj = 19
+        self.fps = 10.0
+        self.dim_feature = self.get_feature_dim(feature)
+        self.files_list, self.labels_list = self.read_datalist(data_path, phase)
+        self.toa_dict = self.get_toa_all(data_path)
+
+    def __len__(self):
+        data_len = len(self.files_list)
+        return data_len
+
+    def get_feature_dim(self, feature_name):
+        if feature_name == 'vgg16':
+            return 4096
+        elif feature_name == 'res101':
+            return 2048
+        else:
+            raise ValueError
+
+    def read_datalist(self, data_path, phase):
+        list_file = os.path.join(data_path, self.feature + '_features', '%s.txt' % (phase))
+        assert os.path.exists(list_file), "file not exists: %s"%(list_file)
+        fid = open(list_file, 'r')
+        data_files, data_labels = [], []
+        for line in fid.readlines():
+            filename, label = line.rstrip().split(' ')
+            data_files.append(filename)
+            data_labels.append(int(label))
+        fid.close()
+        return data_files, data_labels
+
+    def get_toa_all(self, data_path):
+        toa_dict = {}
+        annofile = os.path.join(data_path, 'videos', 'Crash-1500.txt')
+        annoData = self.read_anno_file(annofile)
+        for anno in annoData:
+            labels = np.array(anno['label'], dtype=np.int)
+            toa = np.where(labels == 1)[0][0]
+            toa = min(max(1, toa), self.n_frames-1)
+            toa_dict[anno['vid']] = toa
+        return toa_dict
+
+    def read_anno_file(self, anno_file):
+        assert os.path.exists(anno_file), "Annotation file does not exist! %s"%(anno_file)
+        result = []
+        with open(anno_file, 'r') as f:
+            for line in f.readlines():
+                items = {}
+                items['vid'] = line.strip().split(',[')[0]
+                labels = line.strip().split(',[')[1].split('],')[0]
+                items['label'] = [int(val) for val in labels.split(',')]
+                assert sum(items['label']) > 0, 'invalid accident annotation!'
+                others = line.strip().split(',[')[1].split('],')[1].split(',')
+                items['startframe'], items['vid_ytb'], items['lighting'], items['weather'], items['ego_involve'] = others
+                result.append(items)
+        f.close()
+        return result
+
+    def __getitem__(self, index):
+        data_file = os.path.join(self.data_path, self.feature + '_features', self.files_list[index])
+        assert os.path.exists(data_file), "file not exists: %s"%(data_file)
+        try:
+            data = np.load(data_file)
+            features = data['data'] 
+            labels = data['labels']
+            detections = data['det']
+            vid = str(data['ID'])
+        except:
+            raise IOError('Load data error! File: %s'%(data_file))
+        if labels[1] > 0:
+            toa = [self.toa_dict[vid]]
+        else:
+            toa = [self.n_frames + 1]
+
+        if self.toTensor:
+            features = torch.Tensor(features).to(self.device)  
+            labels = torch.Tensor(labels).to(self.device)
+            toa = torch.Tensor(toa).to(self.device)
+
+        if self.vis:
+            return features, labels, toa, detections, vid
+        else:
+            return features, labels, toa
+
+class A3DDataset(Dataset):
+    def __init__(self, data_path, feature, phase='train', toTensor=False, device=torch.device('cuda'), vis=False):
+        self.data_path = data_path
+        self.feature = feature
+        self.phase = phase 
+        self.toTensor = toTensor
+        self.device = device
+        self.vis = vis
+        self.n_frames = 100 
+        self.n_obj = 19 
+        self.fps = 20.0 
+        self.dim_feature = self.get_feature_dim(feature) 
+
+
+        self.files_list, self.labels_list = self.read_datalist(data_path, phase)
+
+    def __len__(self):
+        data_len = len(self.files_list)
+        return data_len
+
+    def get_feature_dim(self, feature_name):
+        if feature_name == 'vgg16':
+            return 4096
+        elif feature_name == 'res101':
+            return 2048
+        else:
+            raise ValueError
+
+    def read_datalist(self, data_path, phase):
+        list_file = os.path.join(data_path, self.feature + '_features', '%s.txt' % (phase))
+        assert os.path.exists(list_file), "file not exists: %s"%(list_file)
+        fid = open(list_file, 'r')
+        data_files, data_labels = [], []
+        for line in fid.readlines():
+            filename, label = line.rstrip().split(' ')
+            data_files.append(filename)
+            data_labels.append(int(label))
+        fid.close()
+
+        return data_files, data_labels
+
+    def get_toa(self, clip_id):
+        clip_id = clip_id if len(clip_id.split('_')[-1]) > 1 else clip_id[:-2]
+        label_file = os.path.join(self.data_path, 'frame_labels', clip_id + '.txt')
+        assert os.path.exists(label_file)
+        f = open(label_file, 'r')
+        label_all = []
+        for line in f.readlines():
+            label = int(line.rstrip().split(' ')[1])
+            label_all.append(label)
+        f.close()
+        label_all = np.array(label_all, dtype=np.int32)
+        toa = np.where(label_all == 1)[0][0] 
+        toa = max(1, toa)  
+        return toa
+
+    def __getitem__(self, index):
+        data_file = os.path.join(self.data_path, self.feature + '_features', self.files_list[index])
+        assert os.path.exists(data_file), "file not exists: %s"%(data_file)
+        data = np.load(data_file) 
+        features = data['features']
+        label = self.labels_list[index] 
+        label_onehot = np.array([0, 1]) if label > 0 else np.array([1, 0])
+        file_id = self.files_list[index].split('/')[1].split('.npz')[0]
+        if label > 0:
+            toa = [self.get_toa(file_id)]
+        else:
+            toa = [self.n_frames + 1]
+
+        attr = 'positive' if label > 0 else 'negative'
+        dets_file = os.path.join(self.data_path, 'detections', attr, file_id + '.pkl')
+        assert os.path.exists(dets_file), "file not exists: %s"%(dets_file)
+        with open(dets_file, 'rb') as f:
+            detections = pickle.load(f)
+            detections = np.array(detections)
+        f.close()
+
+        if self.toTensor:
+            features = np.array(features)
+            features = torch.from_numpy(features).to(self.device)
+            label_onehot = np.array(label_onehot)
+            label_onehot = torch.from_numpy(label_onehot).to(self.device)
+            toa = np.array(toa)
+            toa = torch.from_numpy(toa).to(self.device)
+
+        if self.vis:
+            return features, label_onehot, toa, detections, file_id
+        else:
+            return features, label_onehot, toa
+
+
+
+if __name__ == '__main__':
+    from torch.utils.data import DataLoader
+    import argparse
+    from tqdm import tqdm
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_path', type=str, default='./data',
+                        help='The relative path of dataset.')
+    parser.add_argument('--dataset', type=str, default='dad', choices=['dad', 'crash'],
+                        help='The name of dataset. Default: dad')
+    parser.add_argument('--batch_size', type=int, default=10,
+                        help='The batch size in training process. Default: 10')
+    parser.add_argument('--feature_name', type=str, default='vgg16', choices=['vgg16', 'res101'],
+                        help='The name of feature embedding methods. Default: vgg16')
+    p = parser.parse_args()
+
+    seed = 123
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    ROOT_PATH = os.path.dirname(os.path.dirname(__file__))
+    data_path = os.path.join(ROOT_PATH, p.data_path, p.dataset)
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+    if p.dataset == 'dad':
+        train_data = DADDataset(data_path, p.feature_name, 'training', toTensor=True, device=device)
+        test_data = DADDataset(data_path, p.feature_name, 'testing', toTensor=True, device=device, vis=True)
+
+    elif p.dataset == 'crash':
+        train_data = CrashDataset(data_path, p.feature_name, 'train', toTensor=True, device=device)
+        test_data = CrashDataset(data_path, p.feature_name, 'test', toTensor=True, device=device, vis=True)
+    else:
+        raise NotImplementedError
+    traindata_loader = DataLoader(dataset=train_data, batch_size=p.batch_size, shuffle=True, drop_last=True)
+    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True)
+
+    for e in range(2):
+        print('Epoch: %d'%(e))
+        for i, (batch_xs, batch_ys, batch_toas) in tqdm(enumerate(traindata_loader), total=len(traindata_loader)):
+            if i == 0:
+                print('feature dim:', batch_xs.size())
+                print('label dim:', batch_ys.size())
+                print('time of accidents dim:', batch_toas.size())
+
+    for e in range(2):
+        print('Epoch: %d'%(e))
+        for i, (batch_xs, batch_ys, batch_toas, detections, video_ids) in \
+            tqdm(enumerate(testdata_loader), desc="batch progress", total=len(testdata_loader)):
+            if i == 0:
+                print('feature dim:', batch_xs.size())
+                print('label dim:', batch_ys.size())
+                print('time of accidents dim:', batch_toas.size())
