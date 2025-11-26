@@ -355,11 +355,94 @@ def update_final_model(src_file, dest_file):
     shutil.copyfile(src_file, dest_file)
 
 
+def test_eval():
+    data_path = os.path.join(ROOT_PATH, p.data_path, p.dataset)
+    result_dir = os.path.join(p.output_dir, p.dataset, 'test_results')
+    if not os.path.exists(result_dir):
+        os.makedirs(result_dir)
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = p.gpus
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+    # 1. Load Data
+    if p.dataset == 'dad':
+        from src.DataLoader import DADDataset
+        test_data = DADDataset(data_path, p.feature_name, 'testing', toTensor=True, device=device)
+    elif p.dataset == 'crash':
+        from src.DataLoader import CrashDataset
+        test_data = CrashDataset(data_path, p.feature_name, 'test', toTensor=True, device=device)
+    else:
+        raise NotImplementedError
+
+    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True)
+
+    # 2. Build Model
+    model = CRASH(test_data.dim_feature, p.hidden_dim, p.latent_dim,
+                        n_layers=p.num_rnn, n_obj=test_data.n_obj, n_frames=test_data.n_frames, fps=test_data.fps,
+                        with_saa=True)
+    model = model.to(device)
+
+    # 3. Load Checkpoint (保持您原本的逻辑，不含特殊修复)
+    if os.path.isfile(p.model_file):
+        print(f"Loading checkpoint: {p.model_file}")
+        checkpoint = torch.load(p.model_file)
+        state_dict = checkpoint['model']
+        
+        # 处理 DataParallel 的 module. 前缀 (标准操作)
+        if list(state_dict.keys())[0].startswith('module.'):
+            from collections import OrderedDict
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] # remove 'module.'
+                new_state_dict[name] = v
+            model.load_state_dict(new_state_dict)
+        else:
+            model.load_state_dict(state_dict)
+    else:
+        print(f"Error: No checkpoint found at {p.model_file}")
+        return
+
+    model.eval()
+
+    # 4. Standard Evaluation (Clean)
+    print("------------------------------------------------")
+    print(">>> Running Standard Evaluation (Clean Data)...")
+    all_pred, all_labels, all_toas, losses_all = test_all(testdata_loader, model)
+    
+    # --- [关键补充] 计算 Clean Video AP ---
+    # 取每个视频在事故发生前(TOA)的最大预测值作为该视频的得分
+    all_vid_scores = [max(pred[:int(toa)]) for toa, pred in zip(all_toas, all_pred)]
+    video_ap = average_precision_score(all_labels, all_vid_scores)
+    # ------------------------------------
+
+    metrics = {}
+    metrics['AP'], metrics['mTTA'], metrics['TTA_R80'], metrics['P_R80'] = evaluation_P_R80(all_pred, all_labels, all_toas, fps=test_data.fps)
+    
+    # 打印结果 (增加了 Video AP)
+    print(f"[Clean Results]\nVideo AP: {video_ap:.4f} | Frame AP: {metrics['AP']:.4f} | mTTA: {metrics['mTTA']:.4f} | TTA_R80: {metrics['TTA_R80']:.4f} | P_R80: {metrics['P_R80']:.4f}")
+    
+    # 5. Robustness Evaluation (Noise)
+    print("------------------------------------------------")
+    print(f">>> Running Robustness Evaluation (Gaussian Noise std={p.noise_std})...")
+    all_pred_n, all_labels_n, all_toas_n = test_noise(testdata_loader, model, stddev=p.noise_std, device=device)
+    
+    # --- [关键补充] 计算 Noisy Video AP ---
+    all_vid_scores_n = [max(pred[:int(toa)]) for toa, pred in zip(all_toas_n, all_pred_n)]
+    video_ap_n = average_precision_score(all_labels_n, all_vid_scores_n)
+    # ------------------------------------
+
+    metrics_n = {}
+    metrics_n['AP'], metrics_n['mTTA'], metrics_n['TTA_R80'], metrics_n['P_R80'] = evaluation_P_R80(all_pred_n, all_labels_n, all_toas_n, fps=test_data.fps)
+    
+    # 打印结果 (增加了 Video AP)
+    print(f"[Noisy Results]\nVideo AP: {video_ap_n:.4f} | Frame AP: {metrics_n['AP']:.4f} | mTTA: {metrics_n['mTTA']:.4f} | TTA_R80: {metrics_n['TTA_R80']:.4f} | P_R80: {metrics_n['P_R80']:.4f}")
+    print("------------------------------------------------")
+
 # --- Updated Argument Parser ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # ... (Original Args) ...
-    parser.add_argument('--output_dir', type=str, default='./output', help='The directory to save the output results.')
+    parser.add_argument('--output_dir', type=str, default='./rub_output', help='The directory to save the output results.')
     parser.add_argument('--data_path', type=str, default='./data', help='The relative path of dataset.')
     parser.add_argument('--dataset', type=str, default='crash', choices=['dad', 'crash', 'a3d'],
                         help='The name of dataset.')
@@ -394,21 +477,7 @@ if __name__ == '__main__':
     p = parser.parse_args()
 
     if p.phase == 'test':
-        # Need to update test_eval too if you want robust testing in 'test' mode
-        # For now, sticking to logic in train_eval where robust features are added
-        from src.Models import CRASH  # Re-import locally if needed or rely on top level
+        test_eval()
 
-        # Assuming test_eval calls test_all, you can add test_noise call there too manually
-        # test_eval()
-        # Here is a quick patch to test_eval if needed:
-        if p.dataset == 'crash':
-            # ... existing setup ...
-            pass
-        # I am not rewriting the whole test_eval() to save space, but you should call test_noise() inside it.
-        pass  # Call original test_eval or modified one
-
-        # Calling original test_eval (you assume it exists in context)
-        # Note: You need to define test_eval() function body as in your original file.
-        # I omitted test_eval in this snippet to focus on training modifications.
     else:
         train_eval()
