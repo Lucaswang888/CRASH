@@ -95,8 +95,10 @@ def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
     with torch.no_grad():
         for i, (batch_xs, batch_ys, batch_toas) in enumerate(testdata_loader):
             # 1. 生成噪声
-            noise = torch.normal(mean=0.0, std=stddev, size=batch_xs.size()).to(device)
-            batch_xs_noisy = batch_xs + noise
+            # noise = torch.normal(mean=0.0, std=stddev, size=batch_xs.size()).to(device)
+            # batch_xs_noisy = batch_xs + noise
+            print(">>> [WARNING] 执行全盲测试：输入全为随机噪声，不含任何原图信息！")
+            batch_xs_noisy = torch.randn_like(batch_xs).to(device) * stddev
             
             # ---------------------------------------------------------
             # [关键修改] 制造假标签 (Dummy Labels)
@@ -534,3 +536,4 @@ if __name__ == '__main__':
 
     else:
         train_eval()
+
