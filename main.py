@@ -52,7 +52,7 @@ def test_all(testdata_loader, model):
     with torch.no_grad():
         for i, (batch_xs, batch_ys, batch_toas) in enumerate(testdata_loader):
             losses, all_outputs, hiddens = model(batch_xs, batch_ys, batch_toas,
-                                                 hidden_in=None, nbatch=len(testdata_loader), testing=False)
+                                                 hidden_in=None, nbatch=len(testdata_loader), testing=True)
 
             # Re-calculate total loss for logging
             loss_val = p.loss_u1 / 2 * losses['cross_entropy']
@@ -82,7 +82,9 @@ def test_all(testdata_loader, model):
 
     return all_pred, all_labels, all_toas, losses_all
 
-
+    
+    
+    # ... (后续堆叠代码不变)
 def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
     print(f"Running Test with Gaussian Noise (std={stddev})...")
     all_pred = []
@@ -92,12 +94,26 @@ def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
     model.eval()
     with torch.no_grad():
         for i, (batch_xs, batch_ys, batch_toas) in enumerate(testdata_loader):
-            # Add Gaussian Noise
+            # 1. 生成噪声
             noise = torch.normal(mean=0.0, std=stddev, size=batch_xs.size()).to(device)
             batch_xs_noisy = batch_xs + noise
+            
+            # ---------------------------------------------------------
+            # [关键修改] 制造假标签 (Dummy Labels)
+            # ---------------------------------------------------------
+            # 创建全 0 的假标签，形状和 batch_ys 一样
+            # 这样如果模型试图“偷看” batch_ys，它看到的将是一片空白
+            dummy_ys = torch.zeros_like(batch_ys).to(device)
+            
+            # 创建全 0 的假 TOA (Time of Accident)
+            # 防止模型通过 TOA 直接定位事故发生在哪一帧
+            dummy_toas = torch.zeros_like(batch_toas).to(device)
+            # ---------------------------------------------------------
 
-            _, all_outputs, _ = model(batch_xs_noisy, batch_ys, batch_toas,
-                                      hidden_in=None, nbatch=len(testdata_loader), testing=False)
+            # [关键修改] 传入 dummy_ys 和 dummy_toas，而不是真实的 batch_ys/batch_toas
+            _, all_outputs, _ = model(batch_xs_noisy, dummy_ys, dummy_toas,
+                                      hidden_in=None, nbatch=len(testdata_loader), 
+                                      testing=True)
 
             num_frames = batch_xs.size()[1]
             batch_size = batch_xs.size()[0]
@@ -108,9 +124,13 @@ def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
                 pred_frames[:, t] = np.exp(pred[:, 1]) / np.sum(np.exp(pred), axis=1)
 
             all_pred.append(pred_frames)
-            label_onehot = batch_ys.cpu().numpy()
+            
+            # 注意：保存结果用于计算 AP 时，必须用 **真实标签** (batch_ys)
+            # 这样我们在计算得分时，是拿“模型基于假标签跑出的预测”去和“真实标签”做对比
+            label_onehot = batch_ys.cpu().numpy() 
             label = np.reshape(label_onehot[:, 1], [batch_size, ])
             all_labels.append(label)
+            
             toas = np.squeeze(batch_toas.cpu().numpy()).astype(int)
             all_toas.append(toas)
 
@@ -471,7 +491,7 @@ def test_eval():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     
-    parser.add_argument('--output_dir', type=str, default='./rub_output', help='The directory to save the output results.')
+    parser.add_argument('--output_dir', type=str, default='./rub_output_new', help='The directory to save the output results.')
     parser.add_argument('--data_path', type=str, default='./data', help='The relative path of dataset.')
     parser.add_argument('--dataset', type=str, default='crash', choices=['dad', 'crash', 'a3d'],
                         help='The name of dataset.')
@@ -486,7 +506,7 @@ if __name__ == '__main__':
     parser.add_argument('--latent_dim', type=int, default=256, help='Latent dim.')
     parser.add_argument('--loss_u1', type=float, default=1, help='Weighting factor aux loss.')
     parser.add_argument('--loss_u2', type=float, default=15, help='Weighting factor aux loss.')
-    parser.add_argument('--gpus', type=str, default="0", help="GPU IDs.")
+    parser.add_argument('--gpus', type=str, default="1", help="GPU IDs.")
     parser.add_argument('--phase', type=str, choices=['train', 'test'], help='Phase.')
     parser.add_argument('--evaluate_all', action='store_true', help='Evaluate all epochs.')
     parser.add_argument('--visualize', action='store_true', help='Visualization flag.')
@@ -505,7 +525,7 @@ if __name__ == '__main__':
     parser.add_argument('--steps', type=int, default=5, help='PGD number of steps.')
     parser.add_argument('--adv_weight', type=float, default=1.0, help='Weight for adversarial loss.')
     parser.add_argument('--sim_weight', type=float, default=0.5, help='Weight for similarity/consistency loss.')
-    parser.add_argument('--noise_std', type=float, default=0.1, help='Stddev for Gaussian noise testing.')
+    parser.add_argument('--noise_std', type=float, default=2, help='Stddev for Gaussian noise testing.')
 
     p = parser.parse_args()
 
