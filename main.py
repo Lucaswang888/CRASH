@@ -1,4 +1,4 @@
-# main.py (Updated)
+# main.py (Final Corrected Version)
 
 from __future__ import absolute_import
 from __future__ import division
@@ -10,12 +10,12 @@ import os, time
 import argparse
 import shutil
 import cv2
-import copy  # For Teacher Model
+import copy  
 
 from torch.utils.data import DataLoader
 from src.Models import CRASH
 from src.eval_tools import evaluation_P_R80, print_results, vis_results
-from src.attack import PGD  # IMPORT THE NEW PGD CLASS
+from src.attack import PGD 
 import matplotlib.pyplot as plt
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
@@ -26,10 +26,9 @@ np.random.seed(seed)
 torch.manual_seed(seed)
 ROOT_PATH = os.path.dirname(__file__)
 
-
-# ... (Include average_losses, preprocess_results, draw_curve, get_video_frames, draw_anchors, test_all_vis functions here - unchanged) ...
-# 为了节省篇幅，省略了未修改的辅助函数，请保留原文件中的这些函数。
-# 重点修改 average_losses 之后的 test_all 和 新增的 test_noise
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
 
 def average_losses(losses_all):
     total_loss, cross_entropy, aux_loss = 0, 0, 0
@@ -45,11 +44,11 @@ def average_losses(losses_all):
 
 
 def test_all(testdata_loader, model):
-    # Unchanged logic, just ensure it handles the model correctly
     all_pred = []
     all_labels = []
     all_toas = []
     losses_all = []
+    
     with torch.no_grad():
         for i, (batch_xs, batch_ys, batch_toas) in enumerate(testdata_loader):
             losses, all_outputs, hiddens = model(batch_xs, batch_ys, batch_toas,
@@ -84,7 +83,6 @@ def test_all(testdata_loader, model):
     return all_pred, all_labels, all_toas, losses_all
 
 
-# --- NEW FUNCTION: Test with Noise (Based on Reference Code) ---
 def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
     print(f"Running Test with Gaussian Noise (std={stddev})...")
     all_pred = []
@@ -128,13 +126,13 @@ def write_scalars(logger, cur_epoch, cur_iter, losses, lr):
     cross_entropy = losses['cross_entropy'].mean()
     aux_loss = losses['auxloss'].mean().item()
 
-    # Check for robust losses
     log_dict = {
         'total_loss': total_loss,
         'cross_entropy': cross_entropy,
         'aux_loss': aux_loss,
         'lr': lr
     }
+    # Log robust losses if they exist
     if 'adv_loss' in losses:
         log_dict['adv_loss'] = losses['adv_loss'].item()
     if 'sim_loss' in losses:
@@ -144,8 +142,8 @@ def write_scalars(logger, cur_epoch, cur_iter, losses, lr):
 
 
 def write_test_scalars(logger, cur_epoch, cur_iter, losses, metrics, prefix="test"):
-    total_loss = losses['total_loss'].mean().item() if 'total_loss' in losses else 0
-    cross_entropy = losses['cross_entropy'].mean() if 'cross_entropy' in losses else 0
+    total_loss = losses['total_loss'].mean().item() if 'total_loss' in losses and not isinstance(losses['total_loss'], (int, float)) else 0
+    cross_entropy = losses['cross_entropy'].mean() if 'cross_entropy' in losses and not isinstance(losses['cross_entropy'], (int, float)) else 0
 
     logger.add_scalars(f"{prefix}/losses/total_loss", {'total_loss': total_loss, 'cross_entropy': cross_entropy},
                        cur_iter)
@@ -157,13 +155,33 @@ def write_test_scalars(logger, cur_epoch, cur_iter, losses, metrics, prefix="tes
 def load_checkpoint(model, optimizer=None, filename='checkpoint.pth.tar', isTraining=True):
     start_epoch = 0
     if os.path.isfile(filename):
+        print(f"==> Loading checkpoint from '{filename}'")
         checkpoint = torch.load(filename)
-        start_epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['model'])
-        if isTraining and optimizer is not None:
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch']
+        
+        # Robustly handle 'module.' prefix (DataParallel)
+        state_dict = checkpoint['model']
+        if list(state_dict.keys())[0].startswith('module.'):
+            from collections import OrderedDict
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] # remove 'module.'
+                new_state_dict[name] = v
+            model.load_state_dict(new_state_dict)
+        else:
+            model.load_state_dict(state_dict)
+
+        if isTraining and optimizer is not None and 'optimizer' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
+    else:
+        print(f"Warning: No checkpoint found at '{filename}'")
+    
     return model, optimizer, start_epoch
 
+# ------------------------------------------------------------------------------
+# Main Training Function (Corrected Logic)
+# ------------------------------------------------------------------------------
 
 def train_eval():
     data_path = os.path.join(ROOT_PATH, p.data_path, p.dataset)
@@ -188,53 +206,85 @@ def train_eval():
         train_data = CrashDataset(data_path, p.feature_name, 'train', toTensor=True, device=device)
         test_data = CrashDataset(data_path, p.feature_name, 'test', toTensor=True, device=device)
     else:
-        raise NotImplementedError  # Simplified for brevity
+        raise NotImplementedError 
 
     traindata_loader = DataLoader(dataset=train_data, batch_size=p.batch_size, shuffle=True, drop_last=True)
     testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True)
 
+    # 1. Initialize Student Model (Base)
     model = CRASH(train_data.dim_feature, p.hidden_dim, p.latent_dim,
                   n_layers=p.num_rnn, n_obj=train_data.n_obj, n_frames=train_data.n_frames, fps=train_data.fps,
                   with_saa=True)
 
-    # --- Robustness: Teacher Model Initialization ---
+    # 2. Initialize Teacher Model (If Robust Training)
+    teacher_model = None
     if p.robust_train:
-        print("Initializing Teacher Model for Robustness Training...")
-        teacher_model = copy.deepcopy(model)
+        print(">>> Initializing Teacher Model for Robustness Training...")
+        teacher_model = CRASH(train_data.dim_feature, p.hidden_dim, p.latent_dim,
+                              n_layers=p.num_rnn, n_obj=train_data.n_obj, n_frames=train_data.n_frames, fps=train_data.fps,
+                              with_saa=True)
         teacher_model = teacher_model.to(device)
+        
+        # [CRITICAL FIX] Load PRETRAINED weights into Teacher
+        if p.pretrained_model and os.path.isfile(p.pretrained_model):
+            load_checkpoint(teacher_model, optimizer=None, filename=p.pretrained_model, isTraining=False)
+            print(f">>> Teacher Model loaded from: {p.pretrained_model}")
+        else:
+            raise ValueError("Error: For robust_train, you MUST provide a valid --pretrained_model (Clean Model) for the Teacher!")
+
+        # Freeze Teacher
         teacher_model.eval()
         for param in teacher_model.parameters():
             param.requires_grad = False
 
+    # 3. Optimizer Setup
     optimizer = torch.optim.Adam(model.parameters(), lr=p.base_lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
+    # 4. Load Student Weights
+    start_epoch = -1
+    
+    # Case A: Resume Training (Load 'model_file' which is the partially trained robust model)
+    if p.resume:
+        model = model.to(device) 
+        model, optimizer, start_epoch = load_checkpoint(model, optimizer=optimizer, filename=p.model_file)
+        print(f">>> Resuming Student from epoch {start_epoch}")
+    
+    # Case B: Start Robust Training (Initialize Student with 'pretrained_model' Clean weights)
+    # This allows the student to start with high accuracy and learn robustness, rather than learning from scratch.
+    elif p.robust_train and p.pretrained_model:
+        model = model.to(device)
+        load_checkpoint(model, optimizer=None, filename=p.pretrained_model, isTraining=False)
+        print(f">>> Initialized Student with Pretrained Clean Weights from {p.pretrained_model}")
+        
+    # Case C: Scratch Training
+    else:
+        model = model.to(device)
+        print(">>> Training Student from Scratch (Random Init)")
+
     if torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
-    model = model.to(device=device)
+    
     model.train()
-
-    start_epoch = -1
-    if p.resume:
-        model, optimizer, start_epoch = load_checkpoint(model, optimizer=optimizer, filename=p.model_file)
 
     iter_cur = 0
     best_metric = 0
 
-    # Loss functions for consistency (from reference)
-    loss_rob = torch.nn.L1Loss()  # Or MSELoss depending on feature scale
+    # Loss function for Feature Matching / Consistency
+    # MSE is often better for regression-like matching between features/logits
+    loss_rob = torch.nn.MSELoss() 
 
     for k in range(p.epoch):
-        loop = tqdm(enumerate(traindata_loader), total=len(traindata_loader))
         if k <= start_epoch:
             iter_cur += len(traindata_loader)
             continue
+            
+        loop = tqdm(enumerate(traindata_loader), total=len(traindata_loader))
 
         for i, (batch_xs, batch_ys, batch_toas) in loop:
             optimizer.zero_grad()
 
-            # --- Normal Training Step ---
-            # Forward on Clean Data
+            # --- 1. Standard Forward (Clean Data) ---
             losses, all_outputs, hidden_st = model(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
             # Base Loss Calculation
@@ -243,50 +293,37 @@ def train_eval():
             if 'log' in losses:
                 total_loss += losses['log'].mean()
 
-            # --- Robust Training Step (Adversarial) ---
+            # --- 2. Robust Training Step (Adversarial) ---
             if p.robust_train:
-                # 1. Generate PGD Attack
-                # Note: PGD needs to know which model to attack.
-                # If DataParallel, use model.module.
+                # Get core model for PGD
                 current_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+                
+                # A. Generate PGD Attack using Student
                 pgd = PGD(current_model, eps=p.eps, alpha=p.alpha, steps=p.steps, device=device)
-
-                # Generate perturbed input
                 perturbed_batch_xs = pgd.forward(batch_xs, batch_ys, batch_toas)
 
-                # 2. Forward on Perturbed Data (Student/Current Model)
-                losses_pgd, outputs_pgd, _ = model(perturbed_batch_xs, batch_ys, batch_toas,
-                                                   nbatch=len(traindata_loader))
+                # B. Student Forward on Perturbed Data
+                _, outputs_pgd, _ = model(perturbed_batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
-                # 3. Forward on Clean Data (Teacher Model)
-                # We want the student's perturbed output to match the teacher's clean output
+                # C. Teacher Forward on Clean Data (Ground Truth for Robustness)
                 with torch.no_grad():
-                    losses_th, outputs_th, _ = teacher_model(batch_xs, batch_ys, batch_toas,
-                                                             nbatch=len(traindata_loader))
+                    _, outputs_th, _ = teacher_model(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
-                # 4. Calculate Robust Losses (Inspired by reference code)
-                # Loss 1: Classification on perturbed data
-                # loss_cls_pgd = losses_pgd['cross_entropy'].mean()
+                # D. Calculate Robustness Losses
+                # Stack frame outputs: [Frames, Batch, 2]
+                stack_out_clean = torch.stack(all_outputs)
+                stack_out_pgd = torch.stack(outputs_pgd)
+                stack_out_teacher = torch.stack(outputs_th)
 
-                # Loss 2: Adversarial Loss (Distance between PGD output and Clean Output)
-                # Reference: adv_loss = loss_rob(outputs_PGD, outputs_nos) * args.adv_loss
-                # We need to flatten outputs for L1Loss. CRASH outputs are lists of tensors [frames]
-                # Let's take the last frame or average
-                # CRASH output is a list of [Batch, 2]. Let's stack them.
-                stack_out_pgd = torch.stack(outputs_pgd)  # [Frames, Batch, 2]
-                stack_out_clean = torch.stack(all_outputs)  # [Frames, Batch, 2]
-                stack_out_teacher = torch.stack(outputs_th)  # [Frames, Batch, 2]
+                # Adversarial Loss: Distance(Student_Perturbed, Teacher_Clean)
+                # Goal: Even with noise, output should match the Clean Teacher
+                adv_loss = loss_rob(stack_out_pgd, stack_out_teacher) * p.adv_weight
 
-                # Adversarial Loss: Output(Perturbed) vs Output(Clean Student)
-                adv_loss = loss_rob(stack_out_pgd, stack_out_clean) * p.adv_weight
-
-                # Consistency Loss: Output(Clean Student) vs Output(Clean Teacher)
+                # Consistency Loss: Distance(Student_Clean, Teacher_Clean)
+                # Goal: Don't forget original knowledge (Regularization)
                 sim_loss = loss_rob(stack_out_clean, stack_out_teacher) * p.sim_weight
 
-                # Add to total loss
                 total_loss += adv_loss + sim_loss
-
-                # Log these for Tensorboard
                 losses['adv_loss'] = adv_loss
                 losses['sim_loss'] = sim_loss
 
@@ -299,10 +336,6 @@ def train_eval():
 
             loop.set_description(f"Epoch [{k}/{p.epoch}]")
             loop.set_postfix(loss=losses['total_loss'].item())
-
-            # Update Teacher Model (EMA - Exponential Moving Average is better, but reference uses fixed or simple copy)
-            # If following strict "Distillation" logic from reference, teacher might be fixed pre-trained.
-            # Or we can update teacher occasionally. Here we skip complex EMA for simplicity unless required.
 
             lr = optimizer.param_groups[0]['lr']
             write_scalars(logger, k, iter_cur, losses, lr)
@@ -320,7 +353,7 @@ def train_eval():
                                                                                                         fps=test_data.fps)
                 write_test_scalars(logger, k, iter_cur, loss_val, metrics, prefix="test_clean")
 
-                # 2. Noise Robustness Test (Optional, every few epochs or same iter)
+                # 2. Noise Robustness Test
                 if p.robust_train:
                     all_pred_n, all_labels_n, all_toas_n = test_noise(testdata_loader, model, stddev=p.noise_std,
                                                                       device=device)
@@ -332,15 +365,17 @@ def train_eval():
                 model.train()
 
         model_file = os.path.join(model_dir, 'model_%02d.pth' % (k))
+        # Save model (handle DataParallel wrapping)
+        state_dict_to_save = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+        
         torch.save({'epoch': k,
-                    'model': model.module.state_dict() if len(p.gpus) > 1 else model.state_dict(),
+                    'model': state_dict_to_save,
                     'optimizer': optimizer.state_dict()}, model_file)
 
         # Save best based on Clean AP
         if metrics['AP'] > best_metric:
             best_metric = metrics['AP']
             update_final_model(model_file, os.path.join(model_dir, 'final_model.pth'))
-            # Also save best model as robust checkpoint if robust training
             if p.robust_train:
                 update_final_model(model_file, os.path.join(model_dir, 'final_model_rob.pth'))
 
@@ -382,13 +417,12 @@ def test_eval():
                         with_saa=True)
     model = model.to(device)
 
-    # 3. Load Checkpoint (保持您原本的逻辑，不含特殊修复)
+    # 3. Load Checkpoint
     if os.path.isfile(p.model_file):
         print(f"Loading checkpoint: {p.model_file}")
         checkpoint = torch.load(p.model_file)
         state_dict = checkpoint['model']
         
-        # 处理 DataParallel 的 module. 前缀 (标准操作)
         if list(state_dict.keys())[0].startswith('module.'):
             from collections import OrderedDict
             new_state_dict = OrderedDict()
@@ -409,16 +443,13 @@ def test_eval():
     print(">>> Running Standard Evaluation (Clean Data)...")
     all_pred, all_labels, all_toas, losses_all = test_all(testdata_loader, model)
     
-    # --- [关键补充] 计算 Clean Video AP ---
-    # 取每个视频在事故发生前(TOA)的最大预测值作为该视频的得分
+    # Calculate Clean Video AP
     all_vid_scores = [max(pred[:int(toa)]) for toa, pred in zip(all_toas, all_pred)]
     video_ap = average_precision_score(all_labels, all_vid_scores)
-    # ------------------------------------
 
     metrics = {}
     metrics['AP'], metrics['mTTA'], metrics['TTA_R80'], metrics['P_R80'] = evaluation_P_R80(all_pred, all_labels, all_toas, fps=test_data.fps)
     
-    # 打印结果 (增加了 Video AP)
     print(f"[Clean Results]\nVideo AP: {video_ap:.4f} | Frame AP: {metrics['AP']:.4f} | mTTA: {metrics['mTTA']:.4f} | TTA_R80: {metrics['TTA_R80']:.4f} | P_R80: {metrics['P_R80']:.4f}")
     
     # 5. Robustness Evaluation (Noise)
@@ -426,22 +457,20 @@ def test_eval():
     print(f">>> Running Robustness Evaluation (Gaussian Noise std={p.noise_std})...")
     all_pred_n, all_labels_n, all_toas_n = test_noise(testdata_loader, model, stddev=p.noise_std, device=device)
     
-    # --- [关键补充] 计算 Noisy Video AP ---
+    # Calculate Noisy Video AP
     all_vid_scores_n = [max(pred[:int(toa)]) for toa, pred in zip(all_toas_n, all_pred_n)]
     video_ap_n = average_precision_score(all_labels_n, all_vid_scores_n)
-    # ------------------------------------
 
     metrics_n = {}
     metrics_n['AP'], metrics_n['mTTA'], metrics_n['TTA_R80'], metrics_n['P_R80'] = evaluation_P_R80(all_pred_n, all_labels_n, all_toas_n, fps=test_data.fps)
     
-    # 打印结果 (增加了 Video AP)
     print(f"[Noisy Results]\nVideo AP: {video_ap_n:.4f} | Frame AP: {metrics_n['AP']:.4f} | mTTA: {metrics_n['mTTA']:.4f} | TTA_R80: {metrics_n['TTA_R80']:.4f} | P_R80: {metrics_n['P_R80']:.4f}")
     print("------------------------------------------------")
 
 # --- Updated Argument Parser ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    # ... (Original Args) ...
+    
     parser.add_argument('--output_dir', type=str, default='./rub_output', help='The directory to save the output results.')
     parser.add_argument('--data_path', type=str, default='./data', help='The relative path of dataset.')
     parser.add_argument('--dataset', type=str, default='crash', choices=['dad', 'crash', 'a3d'],
@@ -463,10 +492,14 @@ if __name__ == '__main__':
     parser.add_argument('--visualize', action='store_true', help='Visualization flag.')
     parser.add_argument('--resume', action='store_true', help='Resume training.')
     parser.add_argument('--model_file', type=str, default='./output/CRASH/vgg16/dad/snapshot/model_23.pth',
-                        help='Model file.')
+                        help='Model file to save to (Student) or Resume from.')
 
     # --- NEW ROBUSTNESS ARGS ---
     parser.add_argument('--robust_train', action='store_true', help='Enable Adversarial Training (PGD).')
+    # [IMPORTANT] New arg for Teacher
+    parser.add_argument('--pretrained_model', type=str, default=None, 
+                        help='Path to the Clean Pretrained Model (Teacher) weights. REQUIRED for robust_train.')
+    
     parser.add_argument('--eps', type=float, default=0.01, help='PGD epsilon (perturbation magnitude).')
     parser.add_argument('--alpha', type=float, default=0.002, help='PGD alpha (step size).')
     parser.add_argument('--steps', type=int, default=5, help='PGD number of steps.')
