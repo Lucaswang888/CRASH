@@ -1,4 +1,4 @@
-# main.py (Final Corrected Version)
+# main.py (Final Corrected Version with Feature-Level Stability)
 
 from __future__ import absolute_import
 from __future__ import division
@@ -83,8 +83,6 @@ def test_all(testdata_loader, model):
     return all_pred, all_labels, all_toas, losses_all
 
     
-    
-    # ... (后续堆叠代码不变)
 def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
     print(f"Running Test with Gaussian Noise (std={stddev})...")
     all_pred = []
@@ -94,25 +92,15 @@ def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
     model.eval()
     with torch.no_grad():
         for i, (batch_xs, batch_ys, batch_toas) in enumerate(testdata_loader):
-            # 1. 生成噪声
-            # noise = torch.normal(mean=0.0, std=stddev, size=batch_xs.size()).to(device)
-            # batch_xs_noisy = batch_xs + noise
+            # 1. 生成噪声 (Blind Test)
             print(">>> [WARNING] 执行全盲测试：输入全为随机噪声，不含任何原图信息！")
             batch_xs_noisy = torch.randn_like(batch_xs).to(device) * stddev
             
-            # ---------------------------------------------------------
-            # [关键修改] 制造假标签 (Dummy Labels)
-            # ---------------------------------------------------------
-            # 创建全 0 的假标签，形状和 batch_ys 一样
-            # 这样如果模型试图“偷看” batch_ys，它看到的将是一片空白
+            # 2. 制造假标签 (Dummy Labels/TOAs) 防止Leakage
             dummy_ys = torch.zeros_like(batch_ys).to(device)
-            
-            # 创建全 0 的假 TOA (Time of Accident)
-            # 防止模型通过 TOA 直接定位事故发生在哪一帧
             dummy_toas = torch.zeros_like(batch_toas).to(device)
-            # ---------------------------------------------------------
-
-            # [关键修改] 传入 dummy_ys 和 dummy_toas，而不是真实的 batch_ys/batch_toas
+            
+            # 3. Forward
             _, all_outputs, _ = model(batch_xs_noisy, dummy_ys, dummy_toas,
                                       hidden_in=None, nbatch=len(testdata_loader), 
                                       testing=True)
@@ -127,8 +115,7 @@ def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
 
             all_pred.append(pred_frames)
             
-            # 注意：保存结果用于计算 AP 时，必须用 **真实标签** (batch_ys)
-            # 这样我们在计算得分时，是拿“模型基于假标签跑出的预测”去和“真实标签”做对比
+            # Save results for AP calc using REAL labels
             label_onehot = batch_ys.cpu().numpy() 
             label = np.reshape(label_onehot[:, 1], [batch_size, ])
             all_labels.append(label)
@@ -154,11 +141,14 @@ def write_scalars(logger, cur_epoch, cur_iter, losses, lr):
         'aux_loss': aux_loss,
         'lr': lr
     }
-    # Log robust losses if they exist
+    # Log robust losses
     if 'adv_loss' in losses:
         log_dict['adv_loss'] = losses['adv_loss'].item()
     if 'sim_loss' in losses:
         log_dict['sim_loss'] = losses['sim_loss'].item()
+    # Log feature losses
+    if 'feat_loss' in losses:
+        log_dict['feat_loss'] = losses['feat_loss'].item()
 
     logger.add_scalars("train/losses", log_dict, cur_iter)
 
@@ -182,7 +172,6 @@ def load_checkpoint(model, optimizer=None, filename='checkpoint.pth.tar', isTrai
         if 'epoch' in checkpoint:
             start_epoch = checkpoint['epoch']
         
-        # Robustly handle 'module.' prefix (DataParallel)
         state_dict = checkpoint['model']
         if list(state_dict.keys())[0].startswith('module.'):
             from collections import OrderedDict
@@ -202,7 +191,7 @@ def load_checkpoint(model, optimizer=None, filename='checkpoint.pth.tar', isTrai
     return model, optimizer, start_epoch
 
 # ------------------------------------------------------------------------------
-# Main Training Function (Corrected Logic)
+# Main Training Function
 # ------------------------------------------------------------------------------
 
 def train_eval():
@@ -247,7 +236,6 @@ def train_eval():
                               with_saa=True)
         teacher_model = teacher_model.to(device)
         
-        # [CRITICAL FIX] Load PRETRAINED weights into Teacher
         if p.pretrained_model and os.path.isfile(p.pretrained_model):
             load_checkpoint(teacher_model, optimizer=None, filename=p.pretrained_model, isTraining=False)
             print(f">>> Teacher Model loaded from: {p.pretrained_model}")
@@ -265,21 +253,14 @@ def train_eval():
 
     # 4. Load Student Weights
     start_epoch = -1
-    
-    # Case A: Resume Training (Load 'model_file' which is the partially trained robust model)
     if p.resume:
         model = model.to(device) 
         model, optimizer, start_epoch = load_checkpoint(model, optimizer=optimizer, filename=p.model_file)
         print(f">>> Resuming Student from epoch {start_epoch}")
-    
-    # Case B: Start Robust Training (Initialize Student with 'pretrained_model' Clean weights)
-    # This allows the student to start with high accuracy and learn robustness, rather than learning from scratch.
     elif p.robust_train and p.pretrained_model:
         model = model.to(device)
         load_checkpoint(model, optimizer=None, filename=p.pretrained_model, isTraining=False)
         print(f">>> Initialized Student with Pretrained Clean Weights from {p.pretrained_model}")
-        
-    # Case C: Scratch Training
     else:
         model = model.to(device)
         print(">>> Training Student from Scratch (Random Init)")
@@ -292,8 +273,6 @@ def train_eval():
     iter_cur = 0
     best_metric = 0
 
-    # Loss function for Feature Matching / Consistency
-    # MSE is often better for regression-like matching between features/logits
     loss_rob = torch.nn.MSELoss() 
 
     for k in range(p.epoch):
@@ -307,7 +286,8 @@ def train_eval():
             optimizer.zero_grad()
 
             # --- 1. Standard Forward (Clean Data) ---
-            losses, all_outputs, hidden_st = model(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
+            # Capture hidden_st_clean (Feature Level)
+            losses, all_outputs, hidden_st_clean = model(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
             # Base Loss Calculation
             total_loss = p.loss_u1 / 2 * losses['cross_entropy']
@@ -315,43 +295,55 @@ def train_eval():
             if 'log' in losses:
                 total_loss += losses['log'].mean()
 
-            # --- 2. Robust Training Step (Adversarial) ---
+            # --- 2. Robust Training Step (Adversarial + Feature Consistency) ---
             if p.robust_train:
-                # Get core model for PGD
                 current_model = model.module if isinstance(model, torch.nn.DataParallel) else model
                 
-                # A. Generate PGD Attack using Student
+                # A. Generate PGD Attack
                 pgd = PGD(current_model, eps=p.eps, alpha=p.alpha, steps=p.steps, device=device)
                 perturbed_batch_xs = pgd.forward(batch_xs, batch_ys, batch_toas)
 
-                # B. Student Forward on Perturbed Data
-                _, outputs_pgd, _ = model(perturbed_batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
+                # B. Student Forward on Perturbed Data (Capture hidden_st_pgd)
+                _, outputs_pgd, hidden_st_pgd = model(perturbed_batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
-                # C. Teacher Forward on Clean Data (Ground Truth for Robustness)
+                # C. Teacher Forward on Clean Data (Capture hidden_st_teacher)
                 with torch.no_grad():
-                    _, outputs_th, _ = teacher_model(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
+                    _, outputs_th, hidden_st_teacher = teacher_model(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
-                # D. Calculate Robustness Losses
-                # Stack frame outputs: [Frames, Batch, 2]
+                # D. Calculate Losses
+                # Output Level
                 stack_out_clean = torch.stack(all_outputs)
                 stack_out_pgd = torch.stack(outputs_pgd)
                 stack_out_teacher = torch.stack(outputs_th)
 
-                # Adversarial Loss: Distance(Student_Perturbed, Teacher_Clean)
-                # Goal: Even with noise, output should match the Clean Teacher
+                # Feature Level (Hidden States)
+                # CRASH returns hidden states as a list [Batch, Hidden_Dim]. Need to stack to [Frames, Batch, Hidden_Dim]
+                stack_feat_clean = torch.stack(hidden_st_clean)
+                stack_feat_pgd = torch.stack(hidden_st_pgd)
+                stack_feat_teacher = torch.stack(hidden_st_teacher)
+
+                # --- Loss Components ---
+                
+                # 1. Output Adversarial Loss (Student_PGD vs Teacher_Clean)
                 adv_loss = loss_rob(stack_out_pgd, stack_out_teacher) * p.adv_weight
 
-                # Consistency Loss: Distance(Student_Clean, Teacher_Clean)
-                # Goal: Don't forget original knowledge (Regularization)
+                # 2. Output Similarity Loss (Student_Clean vs Teacher_Clean)
                 sim_loss = loss_rob(stack_out_clean, stack_out_teacher) * p.sim_weight
 
-                total_loss += adv_loss + sim_loss
+                # 3. Feature Level Stability & Consistency
+                # Enforce: Student Features (Clean & Perturbed) should match Teacher Features (Clean)
+                feat_consistency = loss_rob(stack_feat_clean, stack_feat_teacher)
+                feat_stability = loss_rob(stack_feat_pgd, stack_feat_teacher)
+                feat_loss = (feat_consistency + feat_stability) * p.feat_weight
+
+                total_loss += adv_loss + sim_loss + feat_loss
+                
                 losses['adv_loss'] = adv_loss
                 losses['sim_loss'] = sim_loss
+                losses['feat_loss'] = feat_loss
 
             losses['total_loss'] = total_loss
 
-            # Backward
             losses['total_loss'].mean().backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
             optimizer.step()
@@ -387,14 +379,12 @@ def train_eval():
                 model.train()
 
         model_file = os.path.join(model_dir, 'model_%02d.pth' % (k))
-        # Save model (handle DataParallel wrapping)
         state_dict_to_save = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
         
         torch.save({'epoch': k,
                     'model': state_dict_to_save,
                     'optimizer': optimizer.state_dict()}, model_file)
 
-        # Save best based on Clean AP
         if metrics['AP'] > best_metric:
             best_metric = metrics['AP']
             update_final_model(model_file, os.path.join(model_dir, 'final_model.pth'))
@@ -516,17 +506,17 @@ if __name__ == '__main__':
     parser.add_argument('--model_file', type=str, default='./output/CRASH/vgg16/dad/snapshot/model_23.pth',
                         help='Model file to save to (Student) or Resume from.')
 
-    # --- NEW ROBUSTNESS ARGS ---
+    # --- ROBUSTNESS ARGS ---
     parser.add_argument('--robust_train', action='store_true', help='Enable Adversarial Training (PGD).')
-    # [IMPORTANT] New arg for Teacher
     parser.add_argument('--pretrained_model', type=str, default=None, 
                         help='Path to the Clean Pretrained Model (Teacher) weights. REQUIRED for robust_train.')
     
     parser.add_argument('--eps', type=float, default=0.01, help='PGD epsilon (perturbation magnitude).')
     parser.add_argument('--alpha', type=float, default=0.002, help='PGD alpha (step size).')
     parser.add_argument('--steps', type=int, default=5, help='PGD number of steps.')
-    parser.add_argument('--adv_weight', type=float, default=1.0, help='Weight for adversarial loss.')
-    parser.add_argument('--sim_weight', type=float, default=0.5, help='Weight for similarity/consistency loss.')
+    parser.add_argument('--adv_weight', type=float, default=1.0, help='Weight for adversarial loss (Output Level).')
+    parser.add_argument('--sim_weight', type=float, default=0.5, help='Weight for similarity loss (Output Level).')
+    parser.add_argument('--feat_weight', type=float, default=0.1, help='Weight for feature consistency/stability loss (Hidden Level).')
     parser.add_argument('--noise_std', type=float, default=2, help='Stddev for Gaussian noise testing.')
 
     p = parser.parse_args()
@@ -536,4 +526,3 @@ if __name__ == '__main__':
 
     else:
         train_eval()
-
