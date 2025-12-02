@@ -195,8 +195,11 @@ class CRASH(nn.Module):
     def rho_2(self):
         return torch.exp(self.log_rho_2)+1e-6    
     
+    
 
-    def forward(self, x, y, toa, hidden_in=None, nbatch=80, testing=False):
+    
+    # 1. 在参数列表中增加 feature_noise_std=0.0
+    def forward(self, x, y, toa, hidden_in=None, nbatch=80, testing=False, feature_noise_std=0.0):
         losses = {'cross_entropy': 0,
                   'total_loss': 0,
                   'log' : 0}
@@ -204,20 +207,28 @@ class CRASH(nn.Module):
             losses.update({'auxloss': 0})
         all_outputs, all_hidden = [], []
 
-
         if hidden_in is None:
             h = Variable(torch.zeros(self.n_layers, x.size(0),  self.h_dim))
         else:
             h = Variable(hidden_in)
         h = h.to(x.device)
 
-
         h_list = []
 
         for t in range(x.size(1)):
-            x_t = self.phi_x(x[:, t])
+            x_t = self.phi_x(x[:, t]) # (Batch, Objects, Hidden_Dim)
+            
+            # --- [新增] 特征层扰动注入逻辑 ---
+            # 只有在测试敏感度时，feature_noise_std 才会大于 0
+            if testing and feature_noise_std > 0.0:
+                # 生成与特征形状一致的高斯噪声
+                noise = torch.randn_like(x_t) * feature_noise_std
+                x_t = x_t + noise
+            # -------------------------------
+
             img_embed = x_t[:, 0, :].unsqueeze(1)
             img_tmp = img_embed.view(x.size(0),512,1)
+            # ... (后面的代码保持不变) ...
             img_tmp = self.fftblock(img_tmp)
             img_tmp = img_tmp.view(x.size(0),1,512)
             img_fft = self.phi_x3(img_tmp)
