@@ -1,4 +1,4 @@
-# main.py (Final Corrected Version with Feature-Level Stability)
+# main.py (Final Version: Simultaneous Optimization, No Detach)
 
 from __future__ import absolute_import
 from __future__ import division
@@ -54,7 +54,6 @@ def test_all(testdata_loader, model):
             losses, all_outputs, hiddens = model(batch_xs, batch_ys, batch_toas,
                                                  hidden_in=None, nbatch=len(testdata_loader), testing=True)
 
-            # Re-calculate total loss for logging
             loss_val = p.loss_u1 / 2 * losses['cross_entropy']
             loss_val += p.loss_u2 / 2 * losses['auxloss']
             if 'log' in losses:
@@ -84,7 +83,7 @@ def test_all(testdata_loader, model):
 
     
 def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
-    print(f"Running Test with Gaussian Noise (std={stddev})...")
+    print(f">>> Running Input Gaussian Noise Test (std={stddev})...")
     all_pred = []
     all_labels = []
     all_toas = []
@@ -92,15 +91,13 @@ def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
     model.eval()
     with torch.no_grad():
         for i, (batch_xs, batch_ys, batch_toas) in enumerate(testdata_loader):
-            # 1. 生成噪声 (Blind Test)
-            print(">>> [WARNING] 执行全盲测试：输入全为随机噪声，不含任何原图信息！")
-            batch_xs_noisy = torch.randn_like(batch_xs).to(device) * stddev
+            # 加噪测试逻辑：原图 + 噪声
+            noise = torch.randn_like(batch_xs).to(device) * stddev
+            batch_xs_noisy = batch_xs + noise
             
-            # 2. 制造假标签 (Dummy Labels/TOAs) 防止Leakage
             dummy_ys = torch.zeros_like(batch_ys).to(device)
             dummy_toas = torch.zeros_like(batch_toas).to(device)
             
-            # 3. Forward
             _, all_outputs, _ = model(batch_xs_noisy, dummy_ys, dummy_toas,
                                       hidden_in=None, nbatch=len(testdata_loader), 
                                       testing=True)
@@ -115,11 +112,88 @@ def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
 
             all_pred.append(pred_frames)
             
-            # Save results for AP calc using REAL labels
             label_onehot = batch_ys.cpu().numpy() 
             label = np.reshape(label_onehot[:, 1], [batch_size, ])
             all_labels.append(label)
             
+            toas = np.squeeze(batch_toas.cpu().numpy()).astype(int)
+            all_toas.append(toas)
+
+    all_pred = np.vstack((np.vstack(all_pred[:-1]), all_pred[-1]))
+    all_labels = np.hstack((np.hstack(all_labels[:-1]), all_labels[-1]))
+    all_toas = np.hstack((np.hstack(all_toas[:-1]), all_toas[-1]))
+
+    return all_pred, all_labels, all_toas
+
+
+def test_pgd(testdata_loader, model, device, eps=0.01, steps=10, alpha=0.002):
+    print(f">>> Running PGD Attack Test (eps={eps}, steps={steps})...")
+    all_pred = []
+    all_labels = []
+    all_toas = []
+    
+    attacker = PGD(model, eps=eps, alpha=alpha, steps=steps, device=device)
+
+    for i, (batch_xs, batch_ys, batch_toas) in enumerate(tqdm(testdata_loader, desc="PGD Testing")):
+        model.train() 
+        adv_xs = attacker.forward(batch_xs, batch_ys, batch_toas)
+        
+        model.eval()
+        with torch.no_grad():
+            _, all_outputs, _ = model(adv_xs, batch_ys, batch_toas, 
+                                      hidden_in=None, nbatch=len(testdata_loader), testing=True)
+            
+            num_frames = batch_xs.size()[1]
+            batch_size = batch_xs.size()[0]
+            pred_frames = np.zeros((batch_size, num_frames), dtype=np.float32)
+            for t in range(num_frames):
+                pred = all_outputs[t]
+                pred = pred.cpu().numpy() if pred.is_cuda else pred.detach().numpy()
+                pred_frames[:, t] = np.exp(pred[:, 1]) / np.sum(np.exp(pred), axis=1)
+            all_pred.append(pred_frames)
+            
+            label_onehot = batch_ys.cpu().numpy()
+            label = np.reshape(label_onehot[:, 1], [batch_size, ])
+            all_labels.append(label)
+            toas = np.squeeze(batch_toas.cpu().numpy()).astype(int)
+            all_toas.append(toas)
+
+    all_pred = np.vstack((np.vstack(all_pred[:-1]), all_pred[-1]))
+    all_labels = np.hstack((np.hstack(all_labels[:-1]), all_labels[-1]))
+    all_toas = np.hstack((np.hstack(all_toas[:-1]), all_toas[-1]))
+    
+    return all_pred, all_labels, all_toas
+
+
+def test_feature_perturbation(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
+    print(f">>> Running Feature-Level Noise Test (std={stddev})...")
+    all_pred = []
+    all_labels = []
+    all_toas = []
+
+    model.eval()
+    with torch.no_grad():
+        for i, (batch_xs, batch_ys, batch_toas) in enumerate(testdata_loader):
+            try:
+                _, all_outputs, _ = model(batch_xs, batch_ys, batch_toas,
+                                          hidden_in=None, nbatch=len(testdata_loader), 
+                                          testing=True, feature_noise_std=stddev)
+            except TypeError:
+                print("Error: Your Model does not support 'feature_noise_std'. Please modify src/Models.py.")
+                return None, None, None
+
+            num_frames = batch_xs.size()[1]
+            batch_size = batch_xs.size()[0]
+            pred_frames = np.zeros((batch_size, num_frames), dtype=np.float32)
+            for t in range(num_frames):
+                pred = all_outputs[t]
+                pred = pred.cpu().numpy() if pred.is_cuda else pred.detach().numpy()
+                pred_frames[:, t] = np.exp(pred[:, 1]) / np.sum(np.exp(pred), axis=1)
+
+            all_pred.append(pred_frames)
+            label_onehot = batch_ys.cpu().numpy() 
+            label = np.reshape(label_onehot[:, 1], [batch_size, ])
+            all_labels.append(label)
             toas = np.squeeze(batch_toas.cpu().numpy()).astype(int)
             all_toas.append(toas)
 
@@ -141,12 +215,10 @@ def write_scalars(logger, cur_epoch, cur_iter, losses, lr):
         'aux_loss': aux_loss,
         'lr': lr
     }
-    # Log robust losses
     if 'adv_loss' in losses:
         log_dict['adv_loss'] = losses['adv_loss'].item()
     if 'sim_loss' in losses:
         log_dict['sim_loss'] = losses['sim_loss'].item()
-    # Log feature losses
     if 'feat_loss' in losses:
         log_dict['feat_loss'] = losses['feat_loss'].item()
 
@@ -207,7 +279,6 @@ def train_eval():
     os.environ['CUDA_VISIBLE_DEVICES'] = p.gpus
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-    # Dataset Setup
     if p.dataset == 'dad':
         from src.DataLoader import DADDataset
         train_data = DADDataset(data_path, p.feature_name, 'training', toTensor=True, device=device)
@@ -219,8 +290,9 @@ def train_eval():
     else:
         raise NotImplementedError 
 
-    traindata_loader = DataLoader(dataset=train_data, batch_size=p.batch_size, shuffle=True, drop_last=True)
-    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True)
+    # Optimize DataLoader
+    traindata_loader = DataLoader(dataset=train_data, batch_size=p.batch_size, shuffle=True, drop_last=True, num_workers=4, pin_memory=True)
+    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=4, pin_memory=True)
 
     # 1. Initialize Student Model (Base)
     model = CRASH(train_data.dim_feature, p.hidden_dim, p.latent_dim,
@@ -242,7 +314,6 @@ def train_eval():
         else:
             raise ValueError("Error: For robust_train, you MUST provide a valid --pretrained_model (Clean Model) for the Teacher!")
 
-        # Freeze Teacher
         teacher_model.eval()
         for param in teacher_model.parameters():
             param.requires_grad = False
@@ -286,16 +357,14 @@ def train_eval():
             optimizer.zero_grad()
 
             # --- 1. Standard Forward (Clean Data) ---
-            # Capture hidden_st_clean (Feature Level)
             losses, all_outputs, hidden_st_clean = model(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
-            # Base Loss Calculation
             total_loss = p.loss_u1 / 2 * losses['cross_entropy']
             total_loss += p.loss_u2 / 2 * losses['auxloss']
             if 'log' in losses:
                 total_loss += losses['log'].mean()
 
-            # --- 2. Robust Training Step (Adversarial + Feature Consistency) ---
+            # --- 2. Robust Training Step ---
             if p.robust_train:
                 current_model = model.module if isinstance(model, torch.nn.DataParallel) else model
                 
@@ -303,38 +372,43 @@ def train_eval():
                 pgd = PGD(current_model, eps=p.eps, alpha=p.alpha, steps=p.steps, device=device)
                 perturbed_batch_xs = pgd.forward(batch_xs, batch_ys, batch_toas)
 
-                # B. Student Forward on Perturbed Data (Capture hidden_st_pgd)
+                # B. Student Forward on Perturbed Data
                 _, outputs_pgd, hidden_st_pgd = model(perturbed_batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
-                # C. Teacher Forward on Clean Data (Capture hidden_st_teacher)
+                # C. Teacher Forward (仅用于 Sim Loss / 一致性约束)
                 with torch.no_grad():
                     _, outputs_th, hidden_st_teacher = teacher_model(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
                 # D. Calculate Losses
-                # Output Level
                 stack_out_clean = torch.stack(all_outputs)
                 stack_out_pgd = torch.stack(outputs_pgd)
                 stack_out_teacher = torch.stack(outputs_th)
 
-                # Feature Level (Hidden States)
-                # CRASH returns hidden states as a list [Batch, Hidden_Dim]. Need to stack to [Frames, Batch, Hidden_Dim]
                 stack_feat_clean = torch.stack(hidden_st_clean)
                 stack_feat_pgd = torch.stack(hidden_st_pgd)
                 stack_feat_teacher = torch.stack(hidden_st_teacher)
 
-                # --- Loss Components ---
+                # --- 核心修改逻辑 (NO DETACH) ---
                 
-                # 1. Output Adversarial Loss (Student_PGD vs Teacher_Clean)
-                adv_loss = loss_rob(stack_out_pgd, stack_out_teacher) * p.adv_weight
-
-                # 2. Output Similarity Loss (Student_Clean vs Teacher_Clean)
+                # 1. Output Consistency (输出层一致性): Student(C) vs Teacher(C)
                 sim_loss = loss_rob(stack_out_clean, stack_out_teacher) * p.sim_weight
-
-                # 3. Feature Level Stability & Consistency
-                # Enforce: Student Features (Clean & Perturbed) should match Teacher Features (Clean)
+                
+                # 2. Output Stability (输出层稳定性): Student(P) vs Student(C)
+                # 关键修改：移除 .detach()，允许双向优化 (Simultaneous Optimization)
+                # 模仿 Reference Code: adv_loss = loss_rob(outputs_PGD, outputs_nos)
+                adv_loss = loss_rob(stack_out_pgd, stack_out_clean) * p.adv_weight
+                
+                # 3. Feature Consistency (特征层一致性): Student(C) vs Teacher(C)
                 feat_consistency = loss_rob(stack_feat_clean, stack_feat_teacher)
-                feat_stability = loss_rob(stack_feat_pgd, stack_feat_teacher)
+                
+                # 4. Feature Stability (特征层稳定性): Student(P) vs Student(C)
+                # 关键修改：移除 .detach()，允许双向优化
+                # 模仿 Reference Code: loss_feature = loss_rob(feature_PGD, feature_nos)
+                feat_stability = loss_rob(stack_feat_pgd, stack_feat_clean)
+                
                 feat_loss = (feat_consistency + feat_stability) * p.feat_weight
+
+                # --- 核心修改逻辑结束 ---
 
                 total_loss += adv_loss + sim_loss + feat_loss
                 
@@ -355,26 +429,28 @@ def train_eval():
             write_scalars(logger, k, iter_cur, losses, lr)
 
             iter_cur += 1
+            # ... Inside train_eval loop ...
             if iter_cur % p.test_iter == 0:
                 model.eval()
-                # 1. Standard Test
+                # 1. Clean Test
                 all_pred, all_labels, all_toas, losses_all = test_all(testdata_loader, model)
                 loss_val = average_losses(losses_all)
                 metrics = {}
-                metrics['AP'], metrics['mTTA'], metrics['TTA_R80'], metrics['P_R80'] = evaluation_P_R80(all_pred,
-                                                                                                        all_labels,
-                                                                                                        all_toas,
-                                                                                                        fps=test_data.fps)
+                metrics['AP'], metrics['mTTA'], metrics['TTA_R80'], metrics['P_R80'] = evaluation_P_R80(all_pred, all_labels, all_toas, fps=test_data.fps)
                 write_test_scalars(logger, k, iter_cur, loss_val, metrics, prefix="test_clean")
+                
+                # [新增] 打印 Clean AP 到屏幕
+                print(f"\n[Epoch {k} Iter {iter_cur}] Clean AP: {metrics['AP']:.4f} | mTTA: {metrics['mTTA']:.4f}")
 
-                # 2. Noise Robustness Test
+                # 2. Noise Test
                 if p.robust_train:
-                    all_pred_n, all_labels_n, all_toas_n = test_noise(testdata_loader, model, stddev=p.noise_std,
-                                                                      device=device)
+                    all_pred_n, all_labels_n, all_toas_n = test_noise(testdata_loader, model, stddev=p.noise_std, device=device)
                     metrics_n = {}
-                    metrics_n['AP'], metrics_n['mTTA'], metrics_n['TTA_R80'], metrics_n['P_R80'] = evaluation_P_R80(
-                        all_pred_n, all_labels_n, all_toas_n, fps=test_data.fps)
+                    metrics_n['AP'], metrics_n['mTTA'], metrics_n['TTA_R80'], metrics_n['P_R80'] = evaluation_P_R80(all_pred_n, all_labels_n, all_toas_n, fps=test_data.fps)
                     write_test_scalars(logger, k, iter_cur, {}, metrics_n, prefix="test_noise")
+                    
+                    # [新增] 打印 Noisy AP 到屏幕
+                    print(f"[Epoch {k} Iter {iter_cur}] Noisy AP: {metrics_n['AP']:.4f} | mTTA: {metrics_n['mTTA']:.4f}")
 
                 model.train()
 
@@ -411,7 +487,6 @@ def test_eval():
     os.environ['CUDA_VISIBLE_DEVICES'] = p.gpus
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-    # 1. Load Data
     if p.dataset == 'dad':
         from src.DataLoader import DADDataset
         test_data = DADDataset(data_path, p.feature_name, 'testing', toTensor=True, device=device)
@@ -421,15 +496,13 @@ def test_eval():
     else:
         raise NotImplementedError
 
-    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True)
+    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=4, pin_memory=True)
 
-    # 2. Build Model
     model = CRASH(test_data.dim_feature, p.hidden_dim, p.latent_dim,
                         n_layers=p.num_rnn, n_obj=test_data.n_obj, n_frames=test_data.n_frames, fps=test_data.fps,
                         with_saa=True)
     model = model.to(device)
 
-    # 3. Load Checkpoint
     if os.path.isfile(p.model_file):
         print(f"Loading checkpoint: {p.model_file}")
         checkpoint = torch.load(p.model_file)
@@ -450,12 +523,10 @@ def test_eval():
 
     model.eval()
 
-    # 4. Standard Evaluation (Clean)
     print("------------------------------------------------")
     print(">>> Running Standard Evaluation (Clean Data)...")
     all_pred, all_labels, all_toas, losses_all = test_all(testdata_loader, model)
     
-    # Calculate Clean Video AP
     all_vid_scores = [max(pred[:int(toa)]) for toa, pred in zip(all_toas, all_pred)]
     video_ap = average_precision_score(all_labels, all_vid_scores)
 
@@ -464,12 +535,10 @@ def test_eval():
     
     print(f"[Clean Results]\nVideo AP: {video_ap:.4f} | Frame AP: {metrics['AP']:.4f} | mTTA: {metrics['mTTA']:.4f} | TTA_R80: {metrics['TTA_R80']:.4f} | P_R80: {metrics['P_R80']:.4f}")
     
-    # 5. Robustness Evaluation (Noise)
     print("------------------------------------------------")
     print(f">>> Running Robustness Evaluation (Gaussian Noise std={p.noise_std})...")
     all_pred_n, all_labels_n, all_toas_n = test_noise(testdata_loader, model, stddev=p.noise_std, device=device)
     
-    # Calculate Noisy Video AP
     all_vid_scores_n = [max(pred[:int(toa)]) for toa, pred in zip(all_toas_n, all_pred_n)]
     video_ap_n = average_precision_score(all_labels_n, all_vid_scores_n)
 
@@ -477,9 +546,20 @@ def test_eval():
     metrics_n['AP'], metrics_n['mTTA'], metrics_n['TTA_R80'], metrics_n['P_R80'] = evaluation_P_R80(all_pred_n, all_labels_n, all_toas_n, fps=test_data.fps)
     
     print(f"[Noisy Results]\nVideo AP: {video_ap_n:.4f} | Frame AP: {metrics_n['AP']:.4f} | mTTA: {metrics_n['mTTA']:.4f} | TTA_R80: {metrics_n['TTA_R80']:.4f} | P_R80: {metrics_n['P_R80']:.4f}")
+    
+    print("------------------------------------------------")
+    print(f">>> Running PGD Attack Evaluation (eps={p.eps}, steps={p.steps})...")
+    all_pred_pgd, all_labels_pgd, all_toas_pgd = test_pgd(testdata_loader, model, device, eps=p.eps, steps=p.steps, alpha=p.alpha)
+    
+    all_vid_scores_pgd = [max(pred[:int(toa)]) for toa, pred in zip(all_toas_pgd, all_pred_pgd)]
+    video_ap_pgd = average_precision_score(all_labels_pgd, all_vid_scores_pgd)
+    
+    metrics_pgd = {}
+    metrics_pgd['AP'], metrics_pgd['mTTA'], metrics_pgd['TTA_R80'], metrics_pgd['P_R80'] = evaluation_P_R80(all_pred_pgd, all_labels_pgd, all_toas_pgd, fps=test_data.fps)
+    print(f"[PGD Attack Results]\nVideo AP: {video_ap_pgd:.4f} | Frame AP: {metrics_pgd['AP']:.4f} | mTTA: {metrics_pgd['mTTA']:.4f}")
+    
     print("------------------------------------------------")
 
-# --- Updated Argument Parser ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     
@@ -489,7 +569,7 @@ if __name__ == '__main__':
                         help='The name of dataset.')
     parser.add_argument('--base_lr', type=float, default=1e-4, help='The base learning rate.')
     parser.add_argument('--epoch', type=int, default=80, help='The number of training epoches.')
-    parser.add_argument('--batch_size', type=int, default=10, help='The batch size.')
+    parser.add_argument('--batch_size', type=int, default=32, help='The batch size. Recommended: 32')
     parser.add_argument('--num_rnn', type=int, default=2, help='RNN cells.')
     parser.add_argument('--feature_name', type=str, default='vgg16', choices=['vgg16', 'res101'],
                         help='Feature embedding methods.')
@@ -506,17 +586,17 @@ if __name__ == '__main__':
     parser.add_argument('--model_file', type=str, default='./output/CRASH/vgg16/dad/snapshot/model_23.pth',
                         help='Model file to save to (Student) or Resume from.')
 
-    # --- ROBUSTNESS ARGS ---
+    # --- ROBUSTNESS ARGS (SOTA Config) ---
     parser.add_argument('--robust_train', action='store_true', help='Enable Adversarial Training (PGD).')
     parser.add_argument('--pretrained_model', type=str, default=None, 
                         help='Path to the Clean Pretrained Model (Teacher) weights. REQUIRED for robust_train.')
     
-    parser.add_argument('--eps', type=float, default=0.01, help='PGD epsilon (perturbation magnitude).')
-    parser.add_argument('--alpha', type=float, default=0.002, help='PGD alpha (step size).')
-    parser.add_argument('--steps', type=int, default=5, help='PGD number of steps.')
+    parser.add_argument('--eps', type=float, default=0.02, help='PGD epsilon (perturbation magnitude).')
+    parser.add_argument('--alpha', type=float, default=0.003, help='PGD alpha (step size).')
+    parser.add_argument('--steps', type=int, default=10, help='PGD number of steps.')
     parser.add_argument('--adv_weight', type=float, default=1.0, help='Weight for adversarial loss (Output Level).')
     parser.add_argument('--sim_weight', type=float, default=0.5, help='Weight for similarity loss (Output Level).')
-    parser.add_argument('--feat_weight', type=float, default=0.1, help='Weight for feature consistency/stability loss (Hidden Level).')
+    parser.add_argument('--feat_weight', type=float, default=0.05, help='Weight for feature consistency/stability loss (Hidden Level).')
     parser.add_argument('--noise_std', type=float, default=2, help='Stddev for Gaussian noise testing.')
 
     p = parser.parse_args()
