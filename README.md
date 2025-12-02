@@ -17,19 +17,21 @@ python main.py \
 
   鲁棒性框架训练
 
-  python main.py \
+python main.py \
   --dataset dad \
   --feature_name vgg16 \
   --phase train \
-  --output_dir ./output/robust_train \
-  --epoch 50 \
+  --output_dir ./output/sota_robust \
+  --epoch 80 \
+  --batch_size 32 \
   --robust_train \
-  --pretrained_model ./output/normal_train/dad/snapshot/final_model.pth \
-  --eps 0.01 \
-  --steps 5 \
+  --pretrained_model ./output/baseline/dad/snapshot/final_model.pth \
+  --eps 0.02 \
+  --steps 10 \
+  --alpha 0.003 \
   --adv_weight 1.0 \
   --sim_weight 0.5 \
-  --feat_weight 0.1 \
+  --feat_weight 0.05 \
   --gpus 0
 
 
