@@ -1,4 +1,4 @@
-# main.py (Final Version: Simultaneous Optimization, No Detach)
+# main.py (Final Version: Weighted Consistency for mTTA & Robustness)
 
 from __future__ import absolute_import
 from __future__ import division
@@ -6,6 +6,7 @@ from __future__ import print_function
 
 import numpy as np
 import torch
+import torch.nn as nn
 import os, time
 import argparse
 import shutil
@@ -42,6 +43,52 @@ def average_losses(losses_all):
     losses_mean['auxloss'] = aux_loss / len(losses_all)
     return losses_mean
 
+# [New Function] Exponentially Weighted MSE to boost mTTA
+def weighted_mse_loss(input, target, toas, fps=20.0, weight_factor=5.0):
+    """
+    input: [T, B, C] (Student Output)
+    target: [T, B, C] (Teacher Output)
+    toas: [B] (Time of Accident labels)
+    weight_factor: How much to emphasize the frames near accident (Hyperparameter)
+    """
+    T, B, C = input.shape
+    device = input.device
+    
+    # 1. Create Base Weights (Uniform)
+    weights = torch.ones((T, B), device=device)
+    
+    # 2. Add Temporal Focus Weights (Exponential)
+    # T_grid: [0, 1, ..., T-1] expanded to [T, B]
+    t_grid = torch.arange(T, device=device).unsqueeze(1).expand(T, B)
+    toas_exp = toas.unsqueeze(0).expand(T, B) # [T, B]
+    
+    # Calculate time distance to accident (in seconds)
+    # We only weight frames BEFORE or AT the accident time
+    # mask: 1 if frame is before accident, 0 otherwise (or handle post-accident differently)
+    
+    dist_to_accident = (toas_exp - t_grid).float() / fps
+    
+    # Generate Exponential Weights
+    # Formula: w = 1 + factor * exp(-0.5 * dist)
+    # Only apply to positive samples (where toa > 0) and frames before accident (dist >= 0)
+    
+    # Identify positive samples (assuming toa=0 or T means no accident, check dataset specific)
+    # Usually in DAD/A3D, accident videos have toa > 0.
+    is_accident_video = (toas > 0).float().unsqueeze(0).expand(T, B)
+    is_before_accident = (dist_to_accident >= 0).float()
+    
+    temporal_weight = torch.exp(-0.5 * torch.abs(dist_to_accident))
+    
+    # Final Weight Map: 
+    # Base 1.0 + (Bonus Weight * is_accident * is_before)
+    final_weights = 1.0 + (weight_factor * temporal_weight * is_accident_video * is_before_accident)
+    
+    # 3. Calculate Weighted MSE
+    # Expand weights to [T, B, 1] to broadcast over channels
+    mse = (input - target) ** 2
+    weighted_mse = mse * final_weights.unsqueeze(2)
+    
+    return weighted_mse.mean()
 
 def test_all(testdata_loader, model):
     all_pred = []
@@ -162,45 +209,6 @@ def test_pgd(testdata_loader, model, device, eps=0.01, steps=10, alpha=0.002):
     all_labels = np.hstack((np.hstack(all_labels[:-1]), all_labels[-1]))
     all_toas = np.hstack((np.hstack(all_toas[:-1]), all_toas[-1]))
     
-    return all_pred, all_labels, all_toas
-
-
-def test_feature_perturbation(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
-    print(f">>> Running Feature-Level Noise Test (std={stddev})...")
-    all_pred = []
-    all_labels = []
-    all_toas = []
-
-    model.eval()
-    with torch.no_grad():
-        for i, (batch_xs, batch_ys, batch_toas) in enumerate(testdata_loader):
-            try:
-                _, all_outputs, _ = model(batch_xs, batch_ys, batch_toas,
-                                          hidden_in=None, nbatch=len(testdata_loader), 
-                                          testing=True, feature_noise_std=stddev)
-            except TypeError:
-                print("Error: Your Model does not support 'feature_noise_std'. Please modify src/Models.py.")
-                return None, None, None
-
-            num_frames = batch_xs.size()[1]
-            batch_size = batch_xs.size()[0]
-            pred_frames = np.zeros((batch_size, num_frames), dtype=np.float32)
-            for t in range(num_frames):
-                pred = all_outputs[t]
-                pred = pred.cpu().numpy() if pred.is_cuda else pred.detach().numpy()
-                pred_frames[:, t] = np.exp(pred[:, 1]) / np.sum(np.exp(pred), axis=1)
-
-            all_pred.append(pred_frames)
-            label_onehot = batch_ys.cpu().numpy() 
-            label = np.reshape(label_onehot[:, 1], [batch_size, ])
-            all_labels.append(label)
-            toas = np.squeeze(batch_toas.cpu().numpy()).astype(int)
-            all_toas.append(toas)
-
-    all_pred = np.vstack((np.vstack(all_pred[:-1]), all_pred[-1]))
-    all_labels = np.hstack((np.hstack(all_labels[:-1]), all_labels[-1]))
-    all_toas = np.hstack((np.hstack(all_toas[:-1]), all_toas[-1]))
-
     return all_pred, all_labels, all_toas
 
 
@@ -388,22 +396,21 @@ def train_eval():
                 stack_feat_pgd = torch.stack(hidden_st_pgd)
                 stack_feat_teacher = torch.stack(hidden_st_teacher)
 
-                # --- 核心修改逻辑 (NO DETACH) ---
+                # --- 核心修改逻辑 (Weighted Consistency) ---
                 
                 # 1. Output Consistency (输出层一致性): Student(C) vs Teacher(C)
-                sim_loss = loss_rob(stack_out_clean, stack_out_teacher) * p.sim_weight
+                # 修改点：使用 Weighted MSE 替代普通 MSE，重点关注事故发生前夕的一致性
+                sim_loss = weighted_mse_loss(stack_out_clean, stack_out_teacher, batch_toas, 
+                                             fps=train_data.fps, weight_factor=5.0) * p.sim_weight
                 
                 # 2. Output Stability (输出层稳定性): Student(P) vs Student(C)
-                # 关键修改：移除 .detach()，允许双向优化 (Simultaneous Optimization)
-                # 模仿 Reference Code: adv_loss = loss_rob(outputs_PGD, outputs_nos)
+                # 保持普通 MSE 或也可以尝试加权，但为了鲁棒性，全局稳定更重要，建议保持原样
                 adv_loss = loss_rob(stack_out_pgd, stack_out_clean) * p.adv_weight
                 
                 # 3. Feature Consistency (特征层一致性): Student(C) vs Teacher(C)
                 feat_consistency = loss_rob(stack_feat_clean, stack_feat_teacher)
                 
                 # 4. Feature Stability (特征层稳定性): Student(P) vs Student(C)
-                # 关键修改：移除 .detach()，允许双向优化
-                # 模仿 Reference Code: loss_feature = loss_rob(feature_PGD, feature_nos)
                 feat_stability = loss_rob(stack_feat_pgd, stack_feat_clean)
                 
                 feat_loss = (feat_consistency + feat_stability) * p.feat_weight
