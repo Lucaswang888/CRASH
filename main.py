@@ -1,4 +1,4 @@
-# main.py (Updated: Weighted Consistency for mTTA & Robustness)
+# main.py (Final Version: Single-Process Loading + Weighted Consistency)
 
 from __future__ import absolute_import
 from __future__ import division
@@ -43,41 +43,39 @@ def average_losses(losses_all):
     losses_mean['auxloss'] = aux_loss / len(losses_all)
     return losses_mean
 
-# [New Function] Exponentially Weighted MSE to boost mTTA
+# [New Function] Exponentially Weighted MSE to boost mTTA (Fixed Dimension Bug)
 def weighted_mse_loss(input, target, toas, fps=20.0, weight_factor=5.0):
     """
     input: [T, B, C] (Student Output)
     target: [T, B, C] (Teacher Output)
-    toas: [B] (Time of Accident labels)
+    toas: [B] or [B, 1] (Time of Accident labels)
     weight_factor: How much to emphasize the frames near accident.
     """
     T, B, C = input.shape
     device = input.device
     
+    # [Fix] Ensure toas is 1D tensor [B]
+    if toas.dim() > 1:
+        toas = toas.squeeze(-1)
+
     # 1. Create Base Weights (Uniform = 1.0)
-    # 默认所有帧都有基础的约束力
+    weights = torch.ones((T, B), device=device)
     
     # 2. Add Temporal Focus Weights (Exponential)
-    # T_grid: [0, 1, ..., T-1] expanded to [T, B]
     t_grid = torch.arange(T, device=device).unsqueeze(1).expand(T, B)
     toas_exp = toas.unsqueeze(0).expand(T, B) # [T, B]
     
     # Calculate time distance to accident (in seconds)
-    # dist > 0 means frames BEFORE accident (Pre-accident)
     dist_to_accident = (toas_exp - t_grid).float() / fps
     
-    # Identify positive samples (Assuming toa > 0 means accident video)
-    # And we only apply extra weight to frames BEFORE the accident
+    # Identify positive samples and frames BEFORE accident
     is_accident_video = (toas > 0).float().unsqueeze(0).expand(T, B)
     is_before_accident = (dist_to_accident >= 0).float()
     
     # Exponential Weighting: Closer to accident -> Higher Weight
-    # Formula mimics the Anticipation Loss in CRASH paper
     temporal_weight = torch.exp(-0.5 * torch.abs(dist_to_accident))
     
-    # Final Weight Map: 
-    # Weight = 1.0 + (Factor * exp_weight) only for critical frames
-    # If factor=5.0, weight at TOA is 6.0, weight at far background is ~1.0
+    # Final Weight Map
     final_weights = 1.0 + (weight_factor * temporal_weight * is_accident_video * is_before_accident)
     
     # 3. Calculate Weighted MSE
@@ -180,7 +178,8 @@ def test_pgd(testdata_loader, model, device, eps=0.01, steps=10, alpha=0.002):
 
     for i, (batch_xs, batch_ys, batch_toas) in enumerate(tqdm(testdata_loader, desc="PGD Testing")):
         model.train() 
-        adv_xs = attacker.forward(batch_xs, batch_ys, batch_toas, nbatch=len(testdata_loader)) # Updated nbatch
+        # Updated: pass nbatch to attack
+        adv_xs = attacker.forward(batch_xs, batch_ys, batch_toas, nbatch=len(testdata_loader)) 
         
         model.eval()
         with torch.no_grad():
@@ -295,9 +294,9 @@ def train_eval():
     else:
         raise NotImplementedError 
 
-    # Optimize DataLoader
-    traindata_loader = DataLoader(dataset=train_data, batch_size=p.batch_size, shuffle=True, drop_last=True, num_workers=4, pin_memory=True)
-    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=4, pin_memory=True)
+    # Optimize DataLoader [Modified: num_workers=0]
+    traindata_loader = DataLoader(dataset=train_data, batch_size=p.batch_size, shuffle=True, drop_last=True, num_workers=0, pin_memory=True)
+    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=0, pin_memory=True)
 
     # 1. Initialize Student Model (Base)
     model = CRASH(train_data.dim_feature, p.hidden_dim, p.latent_dim,
@@ -397,13 +396,11 @@ def train_eval():
                 # --- 核心修改逻辑 (Weighted Consistency) ---
                 
                 # 1. Output Consistency (输出层一致性): Student(C) vs Teacher(C)
-                # 修改点：使用 Weighted MSE 替代普通 MSE，重点关注事故发生前夕的一致性
-                # 目的：挽救 mTTA，防止因鲁棒性训练导致的曲线平滑
+                # 使用 Weighted MSE，传入 batch_toas
                 sim_loss = weighted_mse_loss(stack_out_clean, stack_out_teacher, batch_toas, 
                                              fps=train_data.fps, weight_factor=p.time_weight_factor) * p.sim_weight
                 
                 # 2. Output Stability (输出层稳定性): Student(P) vs Student(C)
-                # 保持普通 MSE (Global Stability)，确保任何时刻都不受干扰
                 adv_loss = loss_rob(stack_out_pgd, stack_out_clean) * p.adv_weight
                 
                 # 3. Feature Consistency (特征层一致性): Student(C) vs Teacher(C)
@@ -502,7 +499,8 @@ def test_eval():
     else:
         raise NotImplementedError
 
-    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=4, pin_memory=True)
+    # Optimize DataLoader [Modified: num_workers=0]
+    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=0, pin_memory=True)
 
     model = CRASH(test_data.dim_feature, p.hidden_dim, p.latent_dim,
                         n_layers=p.num_rnn, n_obj=test_data.n_obj, n_frames=test_data.n_frames, fps=test_data.fps,
@@ -555,7 +553,7 @@ def test_eval():
     
     print("------------------------------------------------")
     print(f">>> Running PGD Attack Evaluation (eps={p.eps}, steps={p.steps})...")
-    # 注意: 如果 attack.py 也修改了，这里也需要传 nbatch
+    # Note: attack.py needs to handle nbatch
     all_pred_pgd, all_labels_pgd, all_toas_pgd = test_pgd(testdata_loader, model, device, eps=p.eps, steps=p.steps, alpha=p.alpha)
     
     all_vid_scores_pgd = [max(pred[:int(toa)]) for toa, pred in zip(all_toas_pgd, all_pred_pgd)]
