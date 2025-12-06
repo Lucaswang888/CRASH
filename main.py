@@ -1,4 +1,4 @@
-# main.py (Final Version: Single-Process Loading + Weighted Consistency)
+# main.py (Final Version: Correct Student Initialization)
 
 from __future__ import absolute_import
 from __future__ import division
@@ -43,46 +43,34 @@ def average_losses(losses_all):
     losses_mean['auxloss'] = aux_loss / len(losses_all)
     return losses_mean
 
-# [New Function] Exponentially Weighted MSE to boost mTTA (Fixed Dimension Bug)
+# Exponentially Weighted MSE
 def weighted_mse_loss(input, target, toas, fps=20.0, weight_factor=5.0):
     """
-    input: [T, B, C] (Student Output)
-    target: [T, B, C] (Teacher Output)
-    toas: [B] or [B, 1] (Time of Accident labels)
-    weight_factor: How much to emphasize the frames near accident.
+    input: [T, B, C]
+    target: [T, B, C]
+    toas: [B] or [B, 1]
+    weight_factor: Emphasis factor for frames near accident.
     """
     T, B, C = input.shape
     device = input.device
     
-    # [Fix] Ensure toas is 1D tensor [B]
     if toas.dim() > 1:
         toas = toas.squeeze(-1)
 
-    # 1. Create Base Weights (Uniform = 1.0)
     weights = torch.ones((T, B), device=device)
-    
-    # 2. Add Temporal Focus Weights (Exponential)
     t_grid = torch.arange(T, device=device).unsqueeze(1).expand(T, B)
-    toas_exp = toas.unsqueeze(0).expand(T, B) # [T, B]
+    toas_exp = toas.unsqueeze(0).expand(T, B)
     
-    # Calculate time distance to accident (in seconds)
     dist_to_accident = (toas_exp - t_grid).float() / fps
-    
-    # Identify positive samples and frames BEFORE accident
     is_accident_video = (toas > 0).float().unsqueeze(0).expand(T, B)
     is_before_accident = (dist_to_accident >= 0).float()
     
-    # Exponential Weighting: Closer to accident -> Higher Weight
     temporal_weight = torch.exp(-0.5 * torch.abs(dist_to_accident))
     
-    # Final Weight Map
     final_weights = 1.0 + (weight_factor * temporal_weight * is_accident_video * is_before_accident)
     
-    # 3. Calculate Weighted MSE
     mse = (input - target) ** 2
-    # Expand weights to [T, B, 1] to broadcast over channels (C)
     weighted_mse = mse * final_weights.unsqueeze(2)
-    
     return weighted_mse.mean()
 
 def test_all(testdata_loader, model):
@@ -133,10 +121,8 @@ def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
     model.eval()
     with torch.no_grad():
         for i, (batch_xs, batch_ys, batch_toas) in enumerate(testdata_loader):
-            # 加噪测试逻辑：原图 + 噪声
             noise = torch.randn_like(batch_xs).to(device) * stddev
             batch_xs_noisy = batch_xs + noise
-            
             dummy_ys = torch.zeros_like(batch_ys).to(device)
             dummy_toas = torch.zeros_like(batch_toas).to(device)
             
@@ -153,11 +139,9 @@ def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
                 pred_frames[:, t] = np.exp(pred[:, 1]) / np.sum(np.exp(pred), axis=1)
 
             all_pred.append(pred_frames)
-            
             label_onehot = batch_ys.cpu().numpy() 
             label = np.reshape(label_onehot[:, 1], [batch_size, ])
             all_labels.append(label)
-            
             toas = np.squeeze(batch_toas.cpu().numpy()).astype(int)
             all_toas.append(toas)
 
@@ -174,11 +158,11 @@ def test_pgd(testdata_loader, model, device, eps=0.01, steps=10, alpha=0.002):
     all_labels = []
     all_toas = []
     
+    # Initialize PGD without clip args
     attacker = PGD(model, eps=eps, alpha=alpha, steps=steps, device=device)
 
     for i, (batch_xs, batch_ys, batch_toas) in enumerate(tqdm(testdata_loader, desc="PGD Testing")):
         model.train() 
-        # Updated: pass nbatch to attack
         adv_xs = attacker.forward(batch_xs, batch_ys, batch_toas, nbatch=len(testdata_loader)) 
         
         model.eval()
@@ -294,7 +278,7 @@ def train_eval():
     else:
         raise NotImplementedError 
 
-    # Optimize DataLoader [Modified: num_workers=0]
+    # Optimize DataLoader
     traindata_loader = DataLoader(dataset=train_data, batch_size=p.batch_size, shuffle=True, drop_last=True, num_workers=0, pin_memory=False)
     testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=0, pin_memory=False)
 
@@ -326,16 +310,23 @@ def train_eval():
     optimizer = torch.optim.Adam(model.parameters(), lr=p.base_lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
-    # 4. Load Student Weights
+    # 4. Load Student Weights [CRITICAL UPDATE HERE]
     start_epoch = -1
     if p.resume:
         model = model.to(device) 
         model, optimizer, start_epoch = load_checkpoint(model, optimizer=optimizer, filename=p.model_file)
         print(f">>> Resuming Student from epoch {start_epoch}")
-    elif p.robust_train and p.pretrained_model:
+    
+    elif p.robust_train:
+        # ----------------------------------------------------------------------
+        # [修改] 学生模型必须继承教师模型的权重，而不是从0开始
+        # ----------------------------------------------------------------------
+        print(f">>> [Robust Fine-tuning] Copying pretrained weights from Teacher to Student...")
+        # 直接使用 load_state_dict 复制权重，保证完全一致
+        model.load_state_dict(teacher_model.state_dict())
         model = model.to(device)
-        load_checkpoint(model, optimizer=None, filename=p.pretrained_model, isTraining=False)
-        print(f">>> Initialized Student with Pretrained Clean Weights from {p.pretrained_model}")
+        # 注意：这里 optimizer 不需要加载，因为我们是要开始新的微调训练
+    
     else:
         model = model.to(device)
         print(">>> Training Student from Scratch (Random Init)")
@@ -373,14 +364,14 @@ def train_eval():
                 current_model = model.module if isinstance(model, torch.nn.DataParallel) else model
                 
                 # A. Generate PGD Attack
-                # Note: attack.py needs to handle nbatch if using recent version
                 pgd = PGD(current_model, eps=p.eps, alpha=p.alpha, steps=p.steps, device=device)
+                
                 perturbed_batch_xs = pgd.forward(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
                 # B. Student Forward on Perturbed Data
                 _, outputs_pgd, hidden_st_pgd = model(perturbed_batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
-                # C. Teacher Forward (仅用于 Sim Loss / 一致性约束)
+                # C. Teacher Forward (Consistency)
                 with torch.no_grad():
                     _, outputs_th, hidden_st_teacher = teacher_model(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
@@ -393,28 +384,16 @@ def train_eval():
                 stack_feat_pgd = torch.stack(hidden_st_pgd)
                 stack_feat_teacher = torch.stack(hidden_st_teacher)
 
-                # --- 核心修改逻辑 (Weighted Consistency) ---
-                
-                # 1. Output Consistency (输出层一致性): Student(C) vs Teacher(C)
-                # 使用 Weighted MSE，传入 batch_toas
+                # --- Loss Calculation ---
                 sim_loss = weighted_mse_loss(stack_out_clean, stack_out_teacher, batch_toas, 
                                              fps=train_data.fps, weight_factor=p.time_weight_factor) * p.sim_weight
                 
-                # 2. Output Stability (输出层稳定性): Student(P) vs Student(C)
                 adv_loss = loss_rob(stack_out_pgd, stack_out_clean) * p.adv_weight
-                
-                # 3. Feature Consistency (特征层一致性): Student(C) vs Teacher(C)
                 feat_consistency = loss_rob(stack_feat_clean, stack_feat_teacher)
-                
-                # 4. Feature Stability (特征层稳定性): Student(P) vs Student(C)
                 feat_stability = loss_rob(stack_feat_pgd, stack_feat_clean)
-                
                 feat_loss = (feat_consistency + feat_stability) * p.feat_weight
 
-                # --- 核心修改逻辑结束 ---
-
                 total_loss += adv_loss + sim_loss + feat_loss
-                
                 losses['adv_loss'] = adv_loss
                 losses['sim_loss'] = sim_loss
                 losses['feat_loss'] = feat_loss
@@ -442,7 +421,6 @@ def train_eval():
                 metrics['AP'], metrics['mTTA'], metrics['TTA_R80'], metrics['P_R80'] = evaluation_P_R80(all_pred, all_labels, all_toas, fps=test_data.fps)
                 write_test_scalars(logger, k, iter_cur, loss_val, metrics, prefix="test_clean")
                 
-                # [新增] 打印 Clean AP 到屏幕
                 print(f"\n[Epoch {k} Iter {iter_cur}] Clean AP: {metrics['AP']:.4f} | mTTA: {metrics['mTTA']:.4f}")
 
                 # 2. Noise Test
@@ -452,7 +430,6 @@ def train_eval():
                     metrics_n['AP'], metrics_n['mTTA'], metrics_n['TTA_R80'], metrics_n['P_R80'] = evaluation_P_R80(all_pred_n, all_labels_n, all_toas_n, fps=test_data.fps)
                     write_test_scalars(logger, k, iter_cur, {}, metrics_n, prefix="test_noise")
                     
-                    # [新增] 打印 Noisy AP 到屏幕
                     print(f"[Epoch {k} Iter {iter_cur}] Noisy AP: {metrics_n['AP']:.4f} | mTTA: {metrics_n['mTTA']:.4f}")
 
                 model.train()
@@ -499,7 +476,7 @@ def test_eval():
     else:
         raise NotImplementedError
 
-    # Optimize DataLoader [Modified: num_workers=0]
+    # Optimize DataLoader
     testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=0, pin_memory=False)
 
     model = CRASH(test_data.dim_feature, p.hidden_dim, p.latent_dim,
