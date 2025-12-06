@@ -295,8 +295,8 @@ def train_eval():
         raise NotImplementedError 
 
     # Optimize DataLoader [Modified: num_workers=0]
-    traindata_loader = DataLoader(dataset=train_data, batch_size=p.batch_size, shuffle=True, drop_last=True, num_workers=0, pin_memory=True)
-    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=0, pin_memory=True)
+    traindata_loader = DataLoader(dataset=train_data, batch_size=p.batch_size, shuffle=True, drop_last=True, num_workers=0, pin_memory=False)
+    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=0, pin_memory=False)
 
     # 1. Initialize Student Model (Base)
     model = CRASH(train_data.dim_feature, p.hidden_dim, p.latent_dim,
@@ -500,7 +500,7 @@ def test_eval():
         raise NotImplementedError
 
     # Optimize DataLoader [Modified: num_workers=0]
-    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=0, pin_memory=True)
+    testdata_loader = DataLoader(dataset=test_data, batch_size=p.batch_size, shuffle=False, drop_last=True, num_workers=0, pin_memory=False)
 
     model = CRASH(test_data.dim_feature, p.hidden_dim, p.latent_dim,
                         n_layers=p.num_rnn, n_obj=test_data.n_obj, n_frames=test_data.n_frames, fps=test_data.fps,
