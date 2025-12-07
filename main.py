@@ -1,4 +1,4 @@
-# main.py (Final Version: Correct Student Initialization)
+# main.py (Modified: Replace PGD Test with Parameter Perturbation)
 
 from __future__ import absolute_import
 from __future__ import division
@@ -11,7 +11,7 @@ import os, time
 import argparse
 import shutil
 import cv2
-import copy  
+import copy  # 确保导入 copy 用于备份权重
 
 from torch.utils.data import DataLoader
 from src.Models import CRASH
@@ -45,12 +45,6 @@ def average_losses(losses_all):
 
 # Exponentially Weighted MSE
 def weighted_mse_loss(input, target, toas, fps=20.0, weight_factor=5.0):
-    """
-    input: [T, B, C]
-    target: [T, B, C]
-    toas: [B] or [B, 1]
-    weight_factor: Emphasis factor for frames near accident.
-    """
     T, B, C = input.shape
     device = input.device
     
@@ -151,25 +145,46 @@ def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
 
     return all_pred, all_labels, all_toas
 
+# ------------------------------------------------------------------------------
+# [NEW] Parameter Perturbation Test Function (Instead of PGD)
+# ------------------------------------------------------------------------------
+def test_param_perturbation(testdata_loader, model, device, stddev=0.02, target_layer_str='gru_net.gru'):
+    """
+    对指定层（如GRU）的参数注入高斯噪声，进行鲁棒性测试，并在测试后恢复权重。
+    """
+    print(f">>> Running Parameter Perturbation Test (Target: '{target_layer_str}', std={stddev})...")
+    
+    # 1. 备份原始权重 (Deep Copy)
+    # 必须备份，否则模型权重会被永久破坏
+    original_state_dict = copy.deepcopy(model.state_dict())
+    
+    # 2. 对参数注入噪声
+    injected_count = 0
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            # 只有在 param 需要梯度且名字包含目标层字符串时才加噪
+            if param.requires_grad and target_layer_str in name:
+                noise = torch.randn_like(param).to(device) * stddev
+                param.add_(noise) # 原地修改权重
+                injected_count += 1
+    
+    if injected_count == 0:
+        print(f"Warning: No layers found matching '{target_layer_str}'! No noise injected.")
+    else:
+        print(f"Injected noise into {injected_count} parameters.")
 
-def test_pgd(testdata_loader, model, device, eps=0.01, steps=10, alpha=0.002):
-    print(f">>> Running PGD Attack Test (eps={eps}, steps={steps})...")
+    # 3. 运行推理 (逻辑与 test_all 相同，但只取预测结果)
     all_pred = []
     all_labels = []
     all_toas = []
     
-    # Initialize PGD without clip args
-    attacker = PGD(model, eps=eps, alpha=alpha, steps=steps, device=device)
-
-    for i, (batch_xs, batch_ys, batch_toas) in enumerate(tqdm(testdata_loader, desc="PGD Testing")):
-        model.train() 
-        adv_xs = attacker.forward(batch_xs, batch_ys, batch_toas, nbatch=len(testdata_loader)) 
-        
-        model.eval()
-        with torch.no_grad():
-            _, all_outputs, _ = model(adv_xs, batch_ys, batch_toas, 
+    model.eval()
+    with torch.no_grad():
+        for i, (batch_xs, batch_ys, batch_toas) in enumerate(tqdm(testdata_loader, desc="Param Perturb Test")):
+            # 注意：输入不加噪声，只有参数加了噪声
+            _, all_outputs, _ = model(batch_xs, batch_ys, batch_toas, 
                                       hidden_in=None, nbatch=len(testdata_loader), testing=True)
-            
+
             num_frames = batch_xs.size()[1]
             batch_size = batch_xs.size()[0]
             pred_frames = np.zeros((batch_size, num_frames), dtype=np.float32)
@@ -177,8 +192,8 @@ def test_pgd(testdata_loader, model, device, eps=0.01, steps=10, alpha=0.002):
                 pred = all_outputs[t]
                 pred = pred.cpu().numpy() if pred.is_cuda else pred.detach().numpy()
                 pred_frames[:, t] = np.exp(pred[:, 1]) / np.sum(np.exp(pred), axis=1)
+
             all_pred.append(pred_frames)
-            
             label_onehot = batch_ys.cpu().numpy()
             label = np.reshape(label_onehot[:, 1], [batch_size, ])
             all_labels.append(label)
@@ -188,6 +203,10 @@ def test_pgd(testdata_loader, model, device, eps=0.01, steps=10, alpha=0.002):
     all_pred = np.vstack((np.vstack(all_pred[:-1]), all_pred[-1]))
     all_labels = np.hstack((np.hstack(all_labels[:-1]), all_labels[-1]))
     all_toas = np.hstack((np.hstack(all_toas[:-1]), all_toas[-1]))
+
+    # 4. 恢复原始权重 (非常重要！)
+    model.load_state_dict(original_state_dict)
+    print(">>> Original weights restored.")
     
     return all_pred, all_labels, all_toas
 
@@ -385,10 +404,16 @@ def train_eval():
                 stack_feat_teacher = torch.stack(hidden_st_teacher)
 
                 # --- Loss Calculation ---
-                sim_loss = weighted_mse_loss(stack_out_clean, stack_out_teacher, batch_toas, 
+                # 使用 Softmax 后的概率计算 MSE
+                prob_clean = torch.softmax(stack_out_clean, dim=-1)
+                prob_teacher = torch.softmax(stack_out_teacher, dim=-1)
+                prob_pgd = torch.softmax(stack_out_pgd, dim=-1)
+
+                sim_loss = weighted_mse_loss(prob_clean, prob_teacher, batch_toas, 
                                              fps=train_data.fps, weight_factor=p.time_weight_factor) * p.sim_weight
                 
-                adv_loss = loss_rob(stack_out_pgd, stack_out_clean) * p.adv_weight
+                adv_loss = loss_rob(prob_pgd, prob_clean) * p.adv_weight
+                
                 feat_consistency = loss_rob(stack_feat_clean, stack_feat_teacher)
                 feat_stability = loss_rob(stack_feat_pgd, stack_feat_clean)
                 feat_loss = (feat_consistency + feat_stability) * p.feat_weight
@@ -529,16 +554,27 @@ def test_eval():
     print(f"[Noisy Results]\nVideo AP: {video_ap_n:.4f} | Frame AP: {metrics_n['AP']:.4f} | mTTA: {metrics_n['mTTA']:.4f} | TTA_R80: {metrics_n['TTA_R80']:.4f} | P_R80: {metrics_n['P_R80']:.4f}")
     
     print("------------------------------------------------")
-    print(f">>> Running PGD Attack Evaluation (eps={p.eps}, steps={p.steps})...")
-    # Note: attack.py needs to handle nbatch
-    all_pred_pgd, all_labels_pgd, all_toas_pgd = test_pgd(testdata_loader, model, device, eps=p.eps, steps=p.steps, alpha=p.alpha)
     
-    all_vid_scores_pgd = [max(pred[:int(toa)]) for toa, pred in zip(all_toas_pgd, all_pred_pgd)]
-    video_ap_pgd = average_precision_score(all_labels_pgd, all_vid_scores_pgd)
+    # --------------------------------------------------------
+    # [MODIFIED] Replaced PGD Attack with Parameter Perturbation
+    # --------------------------------------------------------
+    # 针对 GRU 层的参数干扰 (模拟 FTS 的 Intermediate Layer Perturbation)
+    # stddev 可以设为 0.02 (论文常用值) 或者使用 p.eps
+    param_noise_std = 0.02 
+    target_layer_name = 'gru_net.gru'
     
-    metrics_pgd = {}
-    metrics_pgd['AP'], metrics_pgd['mTTA'], metrics_pgd['TTA_R80'], metrics_pgd['P_R80'] = evaluation_P_R80(all_pred_pgd, all_labels_pgd, all_toas_pgd, fps=test_data.fps)
-    print(f"[PGD Attack Results]\nVideo AP: {video_ap_pgd:.4f} | Frame AP: {metrics_pgd['AP']:.4f} | mTTA: {metrics_pgd['mTTA']:.4f}")
+    # 调用新函数
+    all_pred_ilp, all_labels_ilp, all_toas_ilp = test_param_perturbation(
+        testdata_loader, model, device, stddev=param_noise_std, target_layer_str=target_layer_name
+    )
+    
+    all_vid_scores_ilp = [max(pred[:int(toa)]) for toa, pred in zip(all_toas_ilp, all_pred_ilp)]
+    video_ap_ilp = average_precision_score(all_labels_ilp, all_vid_scores_ilp)
+    
+    metrics_ilp = {}
+    metrics_ilp['AP'], metrics_ilp['mTTA'], metrics_ilp['TTA_R80'], metrics_ilp['P_R80'] = evaluation_P_R80(all_pred_ilp, all_labels_ilp, all_toas_ilp, fps=test_data.fps)
+    
+    print(f"[Param Perturbation ({target_layer_name}) Results]\nVideo AP: {video_ap_ilp:.4f} | Frame AP: {metrics_ilp['AP']:.4f} | mTTA: {metrics_ilp['mTTA']:.4f}")
     
     print("------------------------------------------------")
 
