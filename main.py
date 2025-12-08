@@ -413,15 +413,26 @@ def train_eval():
                                              fps=train_data.fps, weight_factor=p.time_weight_factor) * p.sim_weight
                 
                 adv_loss = loss_rob(prob_pgd, prob_clean) * p.adv_weight
-                
-                feat_consistency = loss_rob(stack_feat_clean, stack_feat_teacher)
-                feat_stability = loss_rob(stack_feat_pgd, stack_feat_clean)
-                feat_loss = (feat_consistency + feat_stability) * p.feat_weight
 
-                total_loss += adv_loss + sim_loss + feat_loss
+                # ... (前文计算 sim_loss, adv_loss 保持不变) ...
+
+                # [修改前]
+                # feat_consistency = loss_rob(stack_feat_clean, stack_feat_teacher)
+                # feat_stability = loss_rob(stack_feat_pgd, stack_feat_clean)
+                # feat_loss = (feat_consistency + feat_stability) * p.feat_weight
+
+                # [修改后] 分别乘上各自的权重
+                loss_Clm = loss_rob(stack_feat_clean, stack_feat_teacher) * p.feat_cons_weight
+                loss_Sld = loss_rob(stack_feat_pgd, stack_feat_clean) * p.feat_stab_weight
+                
+                # 累加到总 Loss
+                total_loss += adv_loss + sim_loss + loss_Clm + loss_Sld
+                
+                # 记录日志 (可选)
+                losses['feat_cons'] = loss_Clm
+                losses['feat_stab'] = loss_Sld
                 losses['adv_loss'] = adv_loss
                 losses['sim_loss'] = sim_loss
-                losses['feat_loss'] = feat_loss
 
             losses['total_loss'] = total_loss
 
@@ -560,7 +571,7 @@ def test_eval():
     # --------------------------------------------------------
     # 针对 GRU 层的参数干扰 (模拟 FTS 的 Intermediate Layer Perturbation)
     # stddev 可以设为 0.02 (论文常用值) 或者使用 p.eps
-    param_noise_std = 0.02 
+    param_noise_std = 0.2
     target_layer_name = 'gru_net.gru'
     
     # 调用新函数
@@ -587,7 +598,7 @@ if __name__ == '__main__':
                         help='The name of dataset.')
     parser.add_argument('--base_lr', type=float, default=1e-4, help='The base learning rate.')
     parser.add_argument('--epoch', type=int, default=80, help='The number of training epoches.')
-    parser.add_argument('--batch_size', type=int, default=32, help='The batch size. Recommended: 32')
+    parser.add_argument('--batch_size', type=int, default=10, help='The batch size. Recommended: 32')
     parser.add_argument('--num_rnn', type=int, default=2, help='RNN cells.')
     parser.add_argument('--feature_name', type=str, default='vgg16', choices=['vgg16', 'res101'],
                         help='Feature embedding methods.')
@@ -615,7 +626,11 @@ if __name__ == '__main__':
     parser.add_argument('--adv_weight', type=float, default=1.0, help='Weight for adversarial loss (Output Level).')
     parser.add_argument('--sim_weight', type=float, default=0.5, help='Weight for similarity loss (Output Level).')
     parser.add_argument('--feat_weight', type=float, default=0.05, help='Weight for feature consistency/stability loss (Hidden Level).')
-    parser.add_argument('--noise_std', type=float, default=2, help='Stddev for Gaussian noise testing.')
+    parser.add_argument('--noise_std', type=float, default=0.1, help='Stddev for Gaussian noise testing.')
+    parser.add_argument('--feat_cons_weight', type=float, default=0.05, 
+                        help='Weight for Latent Manifold Consistency (Clm)')
+    parser.add_argument('--feat_stab_weight', type=float, default=0.05, 
+                        help='Weight for Latent Dynamics Stability (Sld)')
     
     # [New Arg] Time Weight Factor
     parser.add_argument('--time_weight_factor', type=float, default=5.0, 
