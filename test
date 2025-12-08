@@ -1,4 +1,4 @@
-# main.py (Final Version: Combined Perturbation & Feature Check Integrated)
+# main.py (Final Version: Combined Perturbation [Option A - GRU Only] & Feature Check)
 
 from __future__ import absolute_import
 from __future__ import division
@@ -161,26 +161,30 @@ def test_noise(testdata_loader, model, stddev=0.1, device=torch.device('cuda')):
     return all_pred, all_labels, all_toas
 
 # ------------------------------------------------------------------------------
-# Combined Perturbation Test (Input Noise + Parameter Noise)
+# Combined Perturbation Test (Input Noise + Parameter Noise [GRU Only])
 # ------------------------------------------------------------------------------
-def test_combined_perturbation(testdata_loader, model, input_std=0.1, param_std=0.02, device=torch.device('cuda')):
+def test_combined_perturbation(testdata_loader, model, input_std=0.1, param_std=0.02, target_layer='gru', device=torch.device('cuda')):
     """
-    Worst-Case Evaluation: Simultaneously apply input noise and parameter noise.
+    [Option A: Precise/Local Perturbation]
+    Combined Test: Input Noise + Parameter Noise (ONLY on GRU/Target layers).
     """
-    print(f"\n>>> Running COMBINED Perturbation Test (Input Std={input_std}, Param Std={param_std})...")
+    print(f"\n>>> Running COMBINED Perturbation Test (Input Std={input_std}, Param Std={param_std}, Target='{target_layer}')...")
     
     # 1. Backup Original Weights
     original_state_dict = copy.deepcopy(model.state_dict())
     
-    # 2. Inject Parameter Noise
+    # 2. Inject Parameter Noise (Precise Mode)
+    injected_count = 0
     model.eval()
     with torch.no_grad():
         for name, param in model.named_parameters():
-            if 'weight' in name: # Only perturb weights
+            # [修改点]：只对包含 'weight' 且包含目标层名(如 'gru') 的参数加噪
+            if 'weight' in name and target_layer in name: 
                 param_noise = torch.randn_like(param).to(device) * param_std
                 param.add_(param_noise)
+                injected_count += 1
     
-    print(f"    [Status] Model weights perturbed with std={param_std}")
+    print(f"    [Status] Perturbed {injected_count} parameters in '{target_layer}' layers (std={param_std})")
 
     # 3. Run Test with Input Noise
     all_pred = []
@@ -194,7 +198,7 @@ def test_combined_perturbation(testdata_loader, model, input_std=0.1, param_std=
             input_noise = torch.randn_like(batch_xs).to(device) * input_std
             batch_xs_noisy = batch_xs + input_noise
             
-            # Forward pass (Model has dirty weights, Input is noisy)
+            # Forward pass
             _, all_outputs, _ = model(batch_xs_noisy, batch_ys, batch_toas,
                                       hidden_in=None, nbatch=len(testdata_loader), 
                                       testing=True)
@@ -297,7 +301,7 @@ def train_eval():
         os.makedirs(logs_dir)
     logger = SummaryWriter(logs_dir)
     
-    # [NEW] Save config
+    # Save config
     with open(os.path.join(p.output_dir, p.dataset, 'config.txt'), 'w') as f:
         for key, value in vars(p).items():
             f.write(f'{key}: {value}\n')
@@ -565,19 +569,23 @@ def test_eval():
         metrics_n['AP'], metrics_n['mTTA'], _, _ = evaluation_P_R80(all_pred_n, all_labels_n, all_toas_n, fps=test_data.fps)
         print(f"   [Input Noise std={std}] AP: {metrics_n['AP']:.4f} | mTTA: {metrics_n['mTTA']:.4f}")
     
-    # 3. Combined Perturbation Test
+    # 3. Combined Perturbation Test (Option A: GRU Only)
     print("\n------------------------------------------------")
-    print(f">>> [3/3] Running Combined Perturbation (Worst Case)...")
+    print(f">>> [3/3] Running Combined Perturbation (Precise Mode: GRU)...")
     fixed_param_std = 0.02
     input_noise_levels = [0.05, 0.1, 0.2]
 
     for in_std in input_noise_levels:
         all_pred_c, all_labels_c, all_toas_c = test_combined_perturbation(
-            testdata_loader, model, input_std=in_std, param_std=fixed_param_std, device=device
+            testdata_loader, model, 
+            input_std=in_std, 
+            param_std=fixed_param_std, 
+            target_layer='gru', # 指定只攻击 GRU 层
+            device=device
         )
         metrics_c = {}
         metrics_c['AP'], metrics_c['mTTA'], _, _ = evaluation_P_R80(all_pred_c, all_labels_c, all_toas_c, fps=test_data.fps)
-        print(f"   [Combined: Input={in_std} + Param={fixed_param_std}] AP: {metrics_c['AP']:.4f} | mTTA: {metrics_c['mTTA']:.4f}")
+        print(f"   [Combined: Input={in_std} + Param(GRU)={fixed_param_std}] AP: {metrics_c['AP']:.4f} | mTTA: {metrics_c['mTTA']:.4f}")
 
     print("------------------------------------------------")
 
