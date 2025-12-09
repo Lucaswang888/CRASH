@@ -367,16 +367,28 @@ def train_eval():
             
         loop = tqdm(enumerate(traindata_loader), total=len(traindata_loader))
 
+        # ... 在 train_eval 函数内部 ...
+
         for i, (batch_xs, batch_ys, batch_toas) in loop:
             optimizer.zero_grad()
 
             # --- 1. Standard Forward (Clean Data) ---
             losses, all_outputs, hidden_st_clean = model(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
-            total_loss = p.loss_u1 / 2 * losses['cross_entropy']
-            total_loss += p.loss_u2 / 2 * losses['auxloss']
+            # 计算主任务 Loss 的加权值 (用于后续打印对比)
+            # 注意：p.loss_u1/2 是你在 total_loss 计算时用的系数
+            w_ce_val = (p.loss_u1 / 2) * losses['cross_entropy'].item()
+            w_aux_val = (p.loss_u2 / 2) * losses['auxloss'].item()
+            
+            total_loss = w_ce_val + w_aux_val # 先加上主任务
             if 'log' in losses:
                 total_loss += losses['log'].mean()
+
+            # 初始化鲁棒性相关的 Loss 变量 (防止如果不跑 robust_train 时报错)
+            w_adv_val = 0.0
+            w_sim_val = 0.0
+            w_clm_val = 0.0
+            w_sld_val = 0.0
 
             # --- 2. Robust Training Step ---
             if p.robust_train:
@@ -384,7 +396,6 @@ def train_eval():
                 
                 # A. Generate PGD Attack
                 pgd = PGD(current_model, eps=p.eps, alpha=p.alpha, steps=p.steps, device=device)
-                
                 perturbed_batch_xs = pgd.forward(batch_xs, batch_ys, batch_toas, nbatch=len(traindata_loader))
 
                 # B. Student Forward on Perturbed Data
@@ -403,50 +414,76 @@ def train_eval():
                 stack_feat_pgd = torch.stack(hidden_st_pgd)
                 stack_feat_teacher = torch.stack(hidden_st_teacher)
 
-                # --- Loss Calculation ---
-                # 使用 Softmax 后的概率计算 MSE
                 prob_clean = torch.softmax(stack_out_clean, dim=-1)
                 prob_teacher = torch.softmax(stack_out_teacher, dim=-1)
                 prob_pgd = torch.softmax(stack_out_pgd, dim=-1)
 
+                # --- 计算各项鲁棒性 Loss (并记录加权后的值) ---
+                
+                # 1. Similarity Loss (Consistency with Teacher)
                 sim_loss = weighted_mse_loss(prob_clean, prob_teacher, batch_toas, 
                                              fps=train_data.fps, weight_factor=p.time_weight_factor) * p.sim_weight
-                
+                w_sim_val = sim_loss.item() # 获取数值用于打印
+
+                # 2. Adversarial Loss (Robustness against Attack)
                 adv_loss = loss_rob(prob_pgd, prob_clean) * p.adv_weight
+                w_adv_val = adv_loss.item()
 
-                # ... (前文计算 sim_loss, adv_loss 保持不变) ...
-
-                # [修改前]
-                # feat_consistency = loss_rob(stack_feat_clean, stack_feat_teacher)
-                # feat_stability = loss_rob(stack_feat_pgd, stack_feat_clean)
-                # feat_loss = (feat_consistency + feat_stability) * p.feat_weight
-
-                # [修改后] 分别乘上各自的权重
+                # 3. Feature Consistency (Latent Manifold)
                 loss_Clm = loss_rob(stack_feat_clean, stack_feat_teacher) * p.feat_cons_weight
+                w_clm_val = loss_Clm.item()
+
+                # 4. Feature Stability (Latent Dynamics)
                 loss_Sld = loss_rob(stack_feat_pgd, stack_feat_clean) * p.feat_stab_weight
+                w_sld_val = loss_Sld.item()
                 
-                # 累加到总 Loss
+                # 累加到 total_loss
                 total_loss += adv_loss + sim_loss + loss_Clm + loss_Sld
                 
-                # 记录日志 (可选)
+                # 存入 losses 字典供 Tensorboard 使用
                 losses['feat_cons'] = loss_Clm
                 losses['feat_stab'] = loss_Sld
                 losses['adv_loss'] = adv_loss
                 losses['sim_loss'] = sim_loss
 
+            # --- Backward & Step ---
             losses['total_loss'] = total_loss
+            # 注意：如果 total_loss 是 tensor 标量，backward 不需要 .mean()，如果是 vector 则需要
+            if isinstance(total_loss, torch.Tensor) and total_loss.dim() > 0:
+                 total_loss = total_loss.mean()
+            
+            if isinstance(total_loss, torch.Tensor):
+                total_loss.backward()
+            else:
+                 # 处理极为罕见的情况，loss 已经是 float
+                 pass 
 
-            losses['total_loss'].mean().backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
             optimizer.step()
 
+            # --- [关键修改] 打印 Loss 构成分析 ---
+            # 每 10 个 batch 打印一次，方便观察
+            if i % 10 == 0:
+                print(f"\n[Epoch {k} Iter {i}] Loss Contribution Analysis:")
+                print(f"  > Main Task (CE):   {w_ce_val:.4f}")
+                print(f"  > Main Task (Aux):  {w_aux_val:.4f}")
+                if p.robust_train:
+                    print(f"  > Robust (Adv):     {w_adv_val:.4f} (Weight: {p.adv_weight})")
+                    print(f"  > Teacher (Sim):    {w_sim_val:.4f} (Weight: {p.sim_weight})")
+                    print(f"  > Feat Cons (Clm):  {w_clm_val:.4f} (Weight: {p.feat_cons_weight})")
+                    print(f"  > Feat Stab (Sld):  {w_sld_val:.4f} (Weight: {p.feat_stab_weight})")
+                print(f"  = TOTAL LOSS:       {losses['total_loss'].item():.4f}")
+                print("-" * 40)
+
+            # 更新进度条
             loop.set_description(f"Epoch [{k}/{p.epoch}]")
             loop.set_postfix(loss=losses['total_loss'].item())
 
             lr = optimizer.param_groups[0]['lr']
             write_scalars(logger, k, iter_cur, losses, lr)
-
+            
             iter_cur += 1
+            # ... (后续的 test 代码保持不变) ...
             # ... Inside train_eval loop ...
             if iter_cur % p.test_iter == 0:
                 model.eval()
